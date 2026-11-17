@@ -84,9 +84,11 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
 
 ## 配置
 
-**优先在界面里改**：设置 → 插件 → `dsh-mtool-translate` → 配置，表单字段就是下面这些，改完插件自动重启生效。也可以直接跟助手说「把并发改成 6」「这次用 high 推理」，助手会调 `mtool_translate_config` 写进去。
+**在界面里改**：设置 → 插件 → `dsh-mtool-translate`（点进 bundle 页面，表单在描述和插件行之间）→ 改完点「保存」，**下次翻译立即生效，不用重启**。
 
-参数（YAML 里同样可用）：
+保存的值落在 `~/.dsh/mtool-translate/settings.json`，优先级高于下面 YAML 里的同名项；点「恢复默认」会清掉文件里的覆盖值。也可以在对话里说「并发改 6」，助手会用 `mtool_translate_config` 写同一个文件。
+
+参数（YAML 里同样可用，作为未在页面上覆盖时的默认）：
 
 ```yaml
 - id: mtool-translate

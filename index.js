@@ -37,6 +37,7 @@
 
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { basename, dirname, extname, join, resolve } from 'node:path'
 
 import z from '@deepseek-ai/schemastery'
@@ -1798,7 +1799,7 @@ export function renderContent(value) {
  * @param config - resolved config.
  * @returns The definition passed to `ctx.tools.register`.
  */
-export function defineTranslateTool(ctx, config) {
+export function defineTranslateTool(ctx, config, runtime) {
   return {
     name: 'translate_mtool_file',
     description: 'Translate an MTool game-text export (ManualTransFile.json) into Chinese with this profile\'s model, '
@@ -1886,7 +1887,7 @@ export function defineTranslateTool(ctx, config) {
     // Two runs over one file would race on the same output and cache.
     isConcurrencySafe: () => false,
     async execute(args, exec) {
-      return executeTranslate(ctx, config, args, exec.signal)
+      return executeTranslate(ctx, config, args, exec.signal, runtime)
     },
   }
 }
@@ -1900,8 +1901,12 @@ export function defineTranslateTool(ctx, config) {
  * @param signal - cancellation.
  * @returns The tool result.
  */
-export async function executeTranslate(ctx, config, args, signal) {
+export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
   const startedAt = Date.now()
+  // Settings saved from the Plugins page or the config tool live beside the
+  // profile, not in the Loader row, so they apply without a restart.
+  const override = runtime === undefined ? {} : await readStoredSettings(runtime.stateDir)
+  const config = { ...baseConfig, ...override }
   if (!isPlainObject(args) || !isFilledString(args.path)) {
     throw new Error('mtoolTranslate: `path` must name the exported ManualTransFile.json')
   }
@@ -2054,45 +2059,185 @@ export function pickSettings(config) {
   return out
 }
 
+/** Directory under `DSH_HOME` that holds this plugin's own settings file. */
+export const STATE_DIR_NAME = 'mtool-translate'
+
+/** File the Plugins page and `mtool_translate_config` read and write. */
+export const SETTINGS_FILE = 'settings.json'
+
+/** Route prefix the Plugins page calls; it sits under `/api`. */
+export const ROUTE_PREFIX = '/api/mtool-translate'
+
 /**
- * Locate this plugin's own Loader entry.
+ * Absolute state directory for this plugin: `<DSH_HOME>/mtool-translate`.
  *
- * @param editor - the config editor service.
- * @param ctx - plugin context, whose fiber carries the entry when available.
- * @returns The entry, or undefined.
+ * Same rule as the imagegen plugin, so both live beside the profile data and
+ * neither depends on the process working directory.
+ *
+ * @param env - environment to read `DSH_HOME` from.
+ * @param home - home directory used when `DSH_HOME` states none.
+ * @returns The absolute state directory.
  */
-export function findOwnEntry(editor, ctx) {
-  const own = ctx.fiber?.entry
-  if (own !== undefined) return own
-  const rows = editor.configuration?.() ?? []
-  return rows.find(row => row.entry?.name === 'dsh-mtool-translate'
-    || String(row.entry?.id ?? '').includes('mtool-translate'))?.entry
+export function resolveStateDir(env = process.env, home = homedir()) {
+  const configured = env.DSH_HOME
+  const base = isFilledString(configured) ? configured : join(home, '.dsh')
+  return join(base, STATE_DIR_NAME)
+}
+
+/** The message of a thrown value, whatever was thrown. */
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
- * Read the row's own override (not the merged config).
+ * Read the settings this page or the tool saved.
  *
- * @param editor - the config editor service.
- * @param entry - the loader entry.
- * @returns The override object.
+ * Unknown keys are dropped instead of rejecting the file, so a setting removed
+ * by a later version cannot lock the page out of every saved value.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @returns The stored settings; empty when none exist.
  */
-export function readOverride(editor, entry) {
-  const rows = editor.configuration?.() ?? []
-  return rows.find(row => row.entry === entry)?.override ?? {}
+export async function readStoredSettings(stateDir) {
+  let text
+  try {
+    text = await readFile(join(stateDir, SETTINGS_FILE), 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return {}
+    throw error
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return {}
+  }
+  if (!isPlainObject(parsed)) return {}
+  const known = {}
+  for (const [key, value] of Object.entries(parsed)) {
+    if (SETTING_FIELDS[key] !== undefined) known[key] = value
+  }
+  try {
+    return validateSettings(known)
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Persist settings, replacing the file atomically.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param values - the complete settings to store.
+ */
+export async function writeStoredSettings(stateDir, values) {
+  await writeAtomic(join(stateDir, SETTINGS_FILE), `${JSON.stringify(values, null, 2)}\n`)
+}
+
+/** A JSON response the Plugins page can read. */
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  })
+}
+
+/** Read a JSON body, or undefined when it is absent or malformed. */
+async function readJsonBody(request) {
+  try {
+    return await request.json()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The two routes the Plugins page calls.
+ *
+ * They sit under `/api`, where the connection service has already applied its
+ * host/origin fence and browser authentication, so neither accepts a path or
+ * touches a caller-supplied location.
+ *
+ * @param runtime - the plugin runtime carrying the state directory.
+ * @returns The routes to register on the connection's fetch table.
+ */
+export function buildSettingsRoutes(runtime) {
+  const status = async () => ({
+    settings: pickSettings(resolveConfig(await readStoredSettings(runtime.stateDir))),
+    fields: Object.entries(SETTING_FIELDS).map(([key, field]) => ({ key, ...field })),
+  })
+  return [
+    {
+      path: `${ROUTE_PREFIX}/status`,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        try {
+          return jsonResponse({ ok: true, ...(await status()) })
+        } catch (error) {
+          return jsonResponse({ ok: false, error: messageOf(error) }, 500)
+        }
+      },
+    },
+    {
+      path: `${ROUTE_PREFIX}/update`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await readJsonBody(request)
+          const wanted = isPlainObject(body?.settings) ? body.settings : {}
+          const unset = Array.isArray(body?.unset)
+            ? body.unset.filter(key => SETTING_FIELDS[key] !== undefined)
+            : []
+          if (Object.keys(wanted).length === 0 && unset.length === 0) {
+            return jsonResponse({ ok: false, error: 'a JSON body with settings or unset is required' }, 400)
+          }
+          const values = validateSettings(wanted)
+          const merged = { ...(await readStoredSettings(runtime.stateDir)), ...values }
+          for (const key of unset) delete merged[key]
+          await writeStoredSettings(runtime.stateDir, merged)
+          return jsonResponse({ ok: true, ...(await status()) })
+        } catch (error) {
+          return jsonResponse({ ok: false, error: messageOf(error) }, 400)
+        }
+      },
+    },
+  ]
+}
+
+/**
+ * Mount the Plugins page routes on the Web connection.
+ *
+ * The child fiber waits for a Web composition instead of declaring the service
+ * on the plugin itself: `connection` is absent from a headless profile, where
+ * the tools must still register.
+ *
+ * @param ctx - plugin context.
+ * @param runtime - the plugin runtime.
+ */
+function mountRoutes(ctx, runtime) {
+  ctx.inject(['connection'], (scope) => {
+    scope.effect(() => {
+      const disposers = buildSettingsRoutes(runtime).map(route => scope.connection.fetch.register(route))
+      return () => Promise.all(disposers.map(dispose => dispose())).then(() => undefined)
+    }, 'mtoolTranslate: Plugins-page routes')
+  })
 }
 
 /**
  * The `mtool_translate_config` tool definition.
  *
- * @param ctx - plugin context supplying the config editor.
+ * @param ctx - plugin context.
+ * @param runtime - the plugin runtime carrying the state directory.
  * @returns The definition passed to `ctx.tools.register`.
  */
-export function defineConfigTool(ctx) {
+export function defineConfigTool(ctx, runtime) {
   return {
     name: 'mtool_translate_config',
-    description: 'Read or change the MTool translation plugin\'s settings (reasoning effort, batch size, concurrency, model route, and the rest) and persist them in this profile. '
+    description: 'Read or change the MTool translation plugin\'s settings (reasoning effort, batch size, concurrency, model route, and the rest). '
       + 'Call it with no settings to see the current values; call it with a partial object to save changes. '
-      + 'The plugin restarts when settings change, and the next translate_mtool_file call uses them.',
+      + 'Values apply to the next translate_mtool_file call, and the same settings are editable on the plugin page.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -2116,9 +2261,7 @@ export function defineConfigTool(ctx) {
         required: ['applied', 'settings'],
       },
       render: (_args, value) => {
-        const lines = [value.applied
-          ? 'Settings saved. The plugin restarts to apply them.'
-          : 'Current MTool translation settings:']
+        const lines = [value.applied ? 'Settings saved; the next translation uses them.' : 'Current MTool translation settings:']
         for (const [key, setting] of Object.entries(value.settings)) {
           lines.push(`- ${key}: ${JSON.stringify(setting)}  ${SETTING_FIELDS[key]?.description ?? ''}`.trimEnd())
         }
@@ -2129,24 +2272,19 @@ export function defineConfigTool(ctx) {
     },
     isConcurrencySafe: () => false,
     async execute(args) {
-      const editor = ctx.get('configEditor')
-      if (editor === undefined || typeof editor.edit !== 'function') {
-        throw new Error('mtoolTranslate: the config editor is unavailable in this profile')
-      }
-      const entry = findOwnEntry(editor, ctx)
-      if (entry === undefined) throw new Error('mtoolTranslate: cannot locate this plugin\'s loader entry')
       if (args?.settings === undefined) {
         return {
           applied: false,
-          settings: pickSettings(resolveConfig(readOverride(editor, entry))),
+          settings: pickSettings(resolveConfig(await readStoredSettings(runtime.stateDir))),
           fields: Object.entries(SETTING_FIELDS).map(([key, field]) => ({ key, ...field })),
         }
       }
       const values = validateSettings(args.settings)
-      await editor.edit(entry, current => ({ ...current, ...values }))
+      const merged = { ...(await readStoredSettings(runtime.stateDir)), ...values }
+      await writeStoredSettings(runtime.stateDir, merged)
       return {
         applied: true,
-        settings: pickSettings(resolveConfig({ ...readOverride(editor, entry), ...values })),
+        settings: pickSettings(resolveConfig(merged)),
         fields: Object.entries(SETTING_FIELDS).map(([key, field]) => ({ key, ...field })),
       }
     },
@@ -2154,12 +2292,14 @@ export function defineConfigTool(ctx) {
 }
 
 /**
- * Register `translate_mtool_file` and `mtool_translate_config`.
+ * Register the tools, and mount the Plugins-page routes on a Web composition.
  *
  * @param ctx - plugin context; `tools` is required, `llm` is read per call.
  * @param config - plugin row config, validated here.
  */
 export function apply(ctx, config) {
-  ctx.tools.register(defineTranslateTool(ctx, resolveConfig(config)))
-  ctx.tools.register(defineConfigTool(ctx))
+  const runtime = { stateDir: resolveStateDir() }
+  ctx.tools.register(defineTranslateTool(ctx, resolveConfig(config), runtime))
+  ctx.tools.register(defineConfigTool(ctx, runtime))
+  mountRoutes(ctx, runtime)
 }
