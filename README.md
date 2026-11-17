@@ -5,6 +5,16 @@
 
 MTool 的收费翻译链路本来就是：导出原文 → 送翻 → 加载译文。这个插件只替换中间那一步。
 
+## 安装
+
+```bash
+git clone https://github.com/wooyoojoo/dsh-MTool-translate.git
+cd dsh-MTool-translate
+pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
+```
+
+然后在 DSH 里「插件 → 添加插件」选择该目录。`pnpm install` 不能省：profile 安装 linked 包时不会替它装依赖，缺了 schemastery 插件会加载失败。
+
 ## 用法
 
 1. MTool 里打开游戏，`翻译` → `导出游戏原文`，游戏根目录出现 `ManualTransFile.json`。
