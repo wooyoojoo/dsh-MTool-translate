@@ -49,16 +49,47 @@ export const name = 'mtoolTranslate'
 export const inject = ['tools']
 
 /**
- * Settings a user may change: the two knobs that are worth a decision.
+ * Lines one model request may carry.
+ *
+ * Measured on a real MV export (deepseek-flash, 8 streams): 40 lines cost
+ * ~0.74 s/line, 100 lines ~1.12 s/line, 200 lines ~1.05 s/line. Per-line cost
+ * rises with batch width, so the win comes from streams in flight, not from
+ * one long request; 60 is a small step above the old 40 without leaving the
+ * fast part of that curve.
+ */
+export const DEFAULT_BATCH_LINES = 60
+
+/**
+ * Source characters one model request may carry.
+ *
+ * Only binds on dialogue-heavy files (60 lines x 40 chars). Together with the
+ * line cap it keeps one reply well under `DEFAULT_MAX_TOKENS`.
+ */
+export const DEFAULT_BATCH_CHARS = 2400
+
+/**
+ * Model requests in flight at once.
+ *
+ * Measured on a real file: 8 in flight already saturates the route (~17-18
+ * lines/s); 24 in flight was no faster and stretched every single request from
+ * 14 s to 30 s. Raise it only after seeing headroom, not to make up for batch
+ * width.
+ */
+export const DEFAULT_CONCURRENCY = 8
+
+/**
+ * Settings a user may change: the knobs that are worth a decision.
  *
  * Everything else is fixed in code — source language is detected from the
  * file, the target language is named per call by the user ("日译中"), the model
- * route follows the profile default, and batch shape, retries, and output
- * location are engineering constants. `Config` and the config tool both build
- * from this table, so the Plugins page and the agent see the same surface.
+ * route follows the profile default, and retries and output location are
+ * engineering constants. `Config` and the config tool both build from this
+ * table, so the Plugins page and the agent see the same surface.
  */
 export const SETTING_FIELDS = {
   reasoningEffort: { kind: 'enum', values: ['off', 'low', 'high', 'max'], default: 'low', description: '推理强度：off 最快，low 术语更稳，high/max 更慢' },
+  batchLines: { kind: 'number', min: 8, max: 400, default: DEFAULT_BATCH_LINES, description: '每请求行数：越大请求越少，但单请求延迟更高、错行概率更大' },
+  concurrency: { kind: 'number', min: 1, max: 32, default: DEFAULT_CONCURRENCY, description: '同时在飞的请求数：吞吐的真正杠杆，撞限流就调低' },
 }
 
 /**
@@ -118,15 +149,6 @@ export function validateSettings(values) {
 /** Target language used when neither config nor the call names one. */
 export const DEFAULT_TARGET = '简体中文'
 
-/** Lines one model request may carry. */
-export const DEFAULT_BATCH_LINES = 40
-
-/** Source characters one model request may carry. */
-export const DEFAULT_BATCH_CHARS = 1600
-
-/** Model requests in flight at once. */
-export const DEFAULT_CONCURRENCY = 8
-
 /** Attempts per batch beyond the first. */
 export const DEFAULT_MAX_RETRIES = 2
 
@@ -139,8 +161,15 @@ export const DEFAULT_MAX_TOKENS = 8192
 /**
  * Reasoning effort for the routed model. Translation is formatting, not
  * reasoning: `low` measured the same quality band as `high` at a third of the
- * latency, while `off` occasionally lost domain terms ("イベ" became 活动
- * instead of 事件). `off` stays available per call for bulk drafts.
+ * latency.
+ *
+ * `off` is 7x faster (1 000 lines in 7.5 s vs 52 s) but is a draft mode, not an
+ * equal substitute. Read side by side on 200 dialogue lines: it rewrote the
+ * Japanese quote on 92 of 114 lines (`「` → `“`), polluted 23 of 26 multi-line
+ * items with punctuation the game then draws (`，“…”，`), invented a closing
+ * quote on 21 lines and dropped the opening one on 17, and misparsed `我慢汁`
+ * ("pre-cum") as "can't hold it". `low` did none of those. Keep `low` for
+ * dialogue; `off` is fine for short UI strings without quotes or line breaks.
  */
 export const DEFAULT_REASONING_EFFORT = 'low'
 
@@ -994,6 +1023,24 @@ export function buildBatches(items, options = {}) {
 }
 
 /**
+ * Pack pending lines into requests, keeping the worker pool busy.
+ *
+ * A fixed batch width collapses a small file into a single request, which
+ * serialises what used to be eight parallel ones. Widening is capped so that
+ * every worker gets at least one batch, and narrowing stops at the bisection
+ * width so a misaligned reply still has room to be split.
+ *
+ * @param items - pending work items.
+ * @param config - resolved config carrying `batchLines`, `batchChars`, `concurrency`.
+ * @returns One array per request, each in file order.
+ */
+export function planBatches(items, config) {
+  const perWorker = Math.ceil(items.length / config.concurrency)
+  const batchLines = Math.min(config.batchLines, Math.max(BISECT_MIN_LINES, perWorker))
+  return buildBatches(items, { ...config, batchLines })
+}
+
+/**
  * Normalize every glossary form the plugin accepts.
  *
  * @param value - object map, array of `{source,target}`, array of
@@ -1837,6 +1884,42 @@ export async function complete(llm, route, system, user, signal) {
 }
 
 /**
+ * Batch width above which a misaligned reply is split instead of resent whole.
+ *
+ * Below this, resending the batch is cheaper than the extra round trips; above
+ * it, one dropped line would otherwise re-send hundreds of lines twice and then
+ * fall through to one request per line for the shifted tail.
+ */
+const BISECT_MIN_LINES = 24
+
+/**
+ * Rescue a batch whose reply came back with the wrong number of lines.
+ *
+ * The two halves are translated as independent batches, so a lost line costs
+ * two smaller requests instead of a full resend; recursion stops at
+ * `BISECT_MIN_LINES`, where the existing retry-then-single-line path takes over.
+ * `system` is reused unchanged: it was built from the whole batch, so it is a
+ * superset of what either half needs.
+ *
+ * @param preparedBatch - the batch that failed the shape check.
+ * @param items - its items, in order.
+ * @param context - passed through to `translateBatch`.
+ * @param done - result map to merge into.
+ * @param failures - failure list to append to.
+ */
+async function bisectBatch(preparedBatch, items, context, done, failures) {
+  const half = Math.ceil(items.length / 2)
+  let previous = preparedBatch.previous ?? []
+  for (const part of [items.slice(0, half), items.slice(half)]) {
+    if (part.length === 0) continue
+    const result = await translateBatch({ ...preparedBatch, items: part, previous }, context)
+    for (const [key, value] of result.done) done.set(key, value)
+    failures.push(...result.failures)
+    previous = part.slice(-2).map(item => item.masked ?? item.text)
+  }
+}
+
+/**
  * Translate one batch, retrying the batch and then its individual lines.
  *
  * Placeholders are numbered per batch (`prepareBatch`), which is what lets the
@@ -1872,6 +1955,13 @@ export async function translateBatch(preparedBatch, context) {
       translations = readReply(reply, pending.length)
     } catch (error) {
       lastError = error
+      // A reply that is off by a line will not fix itself by being resent: at
+      // this width, halving costs two small requests instead of two identical
+      // full-batch ones plus a single-line sweep over the shifted tail.
+      if (pending.length >= BISECT_MIN_LINES) {
+        await bisectBatch(preparedBatch, pending, context, done, failures)
+        pending = []
+      }
       continue
     }
     const still = []
@@ -2329,7 +2419,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       dryRun: true,
       done: pending.length === 0,
       totals,
-      batches: { total: buildBatches(pending, config).length, run: 0 },
+      batches: { total: planBatches(pending, config).length, run: 0 },
       usage: { inputTokens: 0, outputTokens: 0 },
       durationMs: Date.now() - startedAt,
       failures: [],
@@ -2357,7 +2447,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
   }
 
   attachGlossary(pending, glossary)
-  const batches = buildBatches(pending, config)
+  const batches = planBatches(pending, config)
   const toRun = maxBatches > 0 ? batches.slice(0, maxBatches) : batches
   const compiled = {
     ...config,

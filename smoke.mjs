@@ -54,6 +54,7 @@ const {
   mergeGlossary,
   normalizeLineEndings,
   parseJsonReply,
+  planBatches,
   prepareBatch,
   prepareText,
   readProjectGlossary,
@@ -64,6 +65,7 @@ const {
   restoreText,
   skipReason,
   stripCodeAffixes,
+  translateBatch,
   unmaskCodes,
   writeProjectGlossary,
 } = await import('./index.js')
@@ -394,6 +396,57 @@ check('batches respect the line and character caps', () => {
   assert.equal(buildBatches(items, { batchLines: 3, batchChars: 1000 }).length, 3)
   const wide = Array.from({ length: 4 }, (_, i) => ({ key: `k${i}`, text: 'x'.repeat(400) }))
   assert.equal(buildBatches(wide, { batchLines: 30, batchChars: 1000 }).length, 2)
+})
+
+await checkAsync('small files keep more than one batch', async () => {
+  const items = Array.from({ length: 100 }, (_, i) => ({ key: `k${i}`, text: 'x' }))
+  const narrow = resolveConfig({ provider: 'stub', model: 'stub-model' })
+  const planned = planBatches(items, narrow)
+  assert.ok(planned.length > 1, 'a 100-line file must not collapse into one request')
+  assert.ok(planned.every(batch => batch.length <= 24))
+})
+
+console.log('bisection bounds a misaligned reply')
+await checkAsync('a wide batch is split instead of resent whole', async () => {
+  const items = Array.from({ length: 30 }, (_, i) => ({ key: `行${i + 1}`, text: `行${i + 1}` }))
+  const settings = resolveConfig({ provider: 'stub', model: 'stub-model' })
+  const prepared = prepareBatch(items, {
+    ...settings,
+    target: '简体中文',
+    sourceLanguage: '日语',
+    exclusion: [],
+    preReplaceRules: [],
+    postReplaceRules: [],
+    previous: [],
+  })
+  let calls = 0
+  const llm = {
+    stream(request) {
+      calls += 1
+      const user = request.messages[0].content[0].text
+      const body = /<textarea>([\s\S]*)<\/textarea>/u.exec(user)?.[1] ?? user
+      const source = extractTranslation(body)
+      // The first reply loses its last line: a shape error at 30 lines.
+      const kept = calls === 1 ? source.slice(0, -1) : source
+      const reply = `<textarea>\n${buildSourceText(kept.map(masked => ({ masked: `译${masked}` })))}\n</textarea>`
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: reply }
+        yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const result = await translateBatch(prepared, {
+    llm,
+    route: { provider: 'stub', model: 'stub-model' },
+    system: 'sys',
+    maxRetries: 0,
+    options: settings,
+  })
+  assert.equal(result.done.size, 30)
+  assert.equal(result.failures.length, 0)
+  // One failed 30-line call, then two 15-line halves — not a 30-line resend.
+  assert.equal(calls, 3)
 })
 
 console.log('end to end against a stub llm')
