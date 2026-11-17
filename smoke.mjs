@@ -356,6 +356,10 @@ check('kana wins over kanji, and other scripts are recognised', () => {
   assert.equal(detectSourceLanguage(['hello world']), '英语')
   assert.equal(detectSourceLanguage(['안녕하세요']), '韩语')
 })
+check('code lines are ignored when guessing the language', () => {
+  assert.equal(detectSourceLanguage(['return this.data', 'uniform float x;', 'これは日本語']), '日语')
+  assert.equal(detectSourceLanguage(['return this.data', 'hello']), '英语')
+})
 check('chinese targets are recognised by name or code', () => {
   assert.equal(isChineseLanguage('简体中文'), true)
   assert.equal(isChineseLanguage('Traditional Chinese'), true)

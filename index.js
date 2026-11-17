@@ -1772,17 +1772,23 @@ export function isJapaneseSource(language) {
  * @returns A language name; `英语` when nothing matches.
  */
 export function detectSourceLanguage(texts) {
-  const sample = texts.slice(0, 500)
   let kana = 0
   let hangul = 0
   let cyrillic = 0
   let han = 0
-  for (const text of sample) {
+  let seen = 0
+  for (const text of texts) {
+    if (seen >= 2000) break
+    // Code says nothing about the language a file is written in.
+    if (looksLikeCode(text)) continue
+    seen += 1
     if (/[\u3041-\u3096\u30a0-\u30ff]/u.test(text)) kana += 1
     else if (/[\uac00-\ud7af]/u.test(text)) hangul += 1
     else if (/[\u0400-\u04ff]/u.test(text)) cyrillic += 1
     else if (/[\u4e00-\u9fff]/u.test(text)) han += 1
   }
+  // One kana anywhere means a Japanese file: a kanji-only sample must not be
+  // mistaken for Chinese just because it held no kana.
   if (kana > 0) return '日语'
   if (hangul > 0) return '韩语'
   if (cyrillic > 0) return '俄语'
@@ -2012,7 +2018,9 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
   const { items, finished, cached, skipped } = collectWork(entries, { force, limit, cache, target, exclusion })
   const pending = items.filter(item => item.skip === undefined && item.cached === undefined)
   // The file decides its own source language; the caller only names the target.
-  const source = detectSourceLanguage(pending.map(item => item.key))
+  // Sample the whole file, not the pending slice: after a first run most lines
+  // are cached, and a pending slice can be all-ASCII leftovers.
+  const source = detectSourceLanguage(Object.keys(entries))
   const sameLanguage = isChineseLanguage(source) && isChineseLanguage(target)
   const totals = {
     entries: Object.keys(entries).length,
