@@ -59,7 +59,6 @@ export const inject = ['tools']
  */
 export const SETTING_FIELDS = {
   reasoningEffort: { kind: 'enum', values: ['off', 'low', 'high', 'max'], default: 'low', description: '推理强度：off 最快，low 术语更稳，high/max 更慢' },
-  cacheEnabled: { kind: 'boolean', default: true, description: '保留增量缓存（.mtool-translate-cache.json），关掉后不再读写' },
 }
 
 /**
@@ -369,7 +368,6 @@ export function resolveConfig(config) {
     // AiNiee exposes these as switches; placeholder/newline/empty checks are
     // always on, these three are opt-in and off by default.
     symbolRepair: boolean('symbolRepair', true),
-    cacheEnabled: boolean('cacheEnabled', true),
     checkReturnedOriginal: boolean('checkReturnedOriginal', false),
     checkResidualOriginal: boolean('checkResidualOriginal', false),
   }
@@ -1242,15 +1240,11 @@ export function defineGlossaryTool(ctx, config, runtime) {
       const projectDir = dirname(inputPath)
       const settings = { ...config, ...(await readStoredSettings(runtime.stateDir)) }
       const target = isFilledString(args.target) ? args.target : settings.target
-      const enabled = settings.cacheEnabled !== false
       const terms = { ...(await readProjectGlossary(projectDir, target)) }
       const action = isFilledString(args.action) ? args.action : 'list'
       const project = projectDir
 
       const save = async () => {
-        if (!enabled) {
-          throw new Error('mtoolTranslate: 增量缓存已关闭；名词表和 .mtool-translate-cache.json 同文件，先在插件页打开缓存')
-        }
         await writeProjectGlossary(projectDir, target, terms)
         return { project, built: false, glossary: glossaryList(terms) }
       }
@@ -2128,9 +2122,9 @@ export function resolveOutput(inputPath, config, requested) {
  * @param explicit - a glossary passed to this call, or undefined.
  * @returns The glossary to apply, as `{ source, target }` pairs.
  */
-export async function mergeGlossary(runtime, inputPath, target, explicit, enabled = true) {
+export async function mergeGlossary(runtime, inputPath, target, explicit) {
   const merged = new Map()
-  if (runtime !== undefined && enabled !== false) {
+  if (runtime !== undefined) {
     const stored = await readProjectGlossary(dirname(inputPath), target)
     for (const [source, value] of Object.entries(stored)) merged.set(source, value)
   }
@@ -2301,11 +2295,11 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
   }
   const route = dryRun ? { provider: 'dry-run', model: 'dry-run' } : resolveRoute(ctx, config, args)
-  const glossary = await mergeGlossary(runtime, inputPath, target, args.glossary ?? config.glossary, config.cacheEnabled)
+  const glossary = await mergeGlossary(runtime, inputPath, target, args.glossary ?? config.glossary)
   const exclusion = compileExclusion(config.exclusion)
 
   const { path: outputPath, cachePath } = resolveOutput(inputPath, config, args.outputPath)
-  const cache = config.cacheEnabled ? await readCache(cachePath, target) : new Map()
+  const cache = await readCache(cachePath, target)
   const { items, finished, cached, skipped } = collectWork(entries, { force, limit, cache, target, exclusion })
   const pending = items.filter(item => item.skip === undefined && item.cached === undefined)
   // The file decides its own source language; the caller only names the target.
@@ -2400,7 +2394,6 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     checkpointChain = checkpointChain.then(async () => {
       for (const [key, value] of translations) entries[key] = value
       await writeAtomic(outputPath, JSON.stringify(entries, null, 4))
-      if (config.cacheEnabled === false) return
       const merged = new Map(cache)
       for (const [key, value] of translations) merged.set(cacheKey(key, target), value)
       await writeCache(cachePath, target, Object.fromEntries(merged))
@@ -2641,7 +2634,7 @@ function mountRoutes(ctx, runtime) {
 export function defineConfigTool(ctx, runtime) {
   return {
     name: 'mtool_translate_config',
-    description: 'Read or change the MTool translation plugin\'s settings (reasoning effort, batch size, concurrency, model route, and the rest). '
+    description: 'Read or change the MTool translation plugin\'s settings (currently the reasoning effort). '
       + 'Call it with no settings to see the current values; call it with a partial object to save changes. '
       + 'Values apply to the next translate_mtool_file call, and the same settings are editable on the plugin page.',
     parameters: {

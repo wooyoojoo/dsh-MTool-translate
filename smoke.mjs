@@ -10,7 +10,6 @@
  * exercised without spending a model call.
  */
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -469,21 +468,6 @@ try {
     assert.equal(llm.calls.length, 0)
     assert.equal(result.totals.cached, 3)
     assert.equal(result.done, true)
-  })
-
-  await checkAsync('cacheEnabled: false neither reads nor writes the cache file', async () => {
-    const sub = join(dir, 'nocache')
-    await mkdir(sub, { recursive: true })
-    const file = join(sub, 'ManualTransFile.json')
-    await writeFile(file, JSON.stringify({ かな: 'かな' }))
-    const nocache = resolveConfig({ provider: 'stub', model: 'stub-model', cacheEnabled: false })
-    const llm = stubLlm(keep)
-    const first = await executeTranslate(stubCtx(llm), nocache, { path: file }, undefined)
-    assert.equal(first.totals.translated, 1)
-    assert.equal(existsSync(join(sub, '.mtool-translate-cache.json')), false)
-    const second = await executeTranslate(stubCtx(llm), nocache, { path: file }, undefined)
-    assert.equal(second.totals.cached, 0)
-    assert.equal(llm.calls.length, 2)
   })
 
   await checkAsync('a Chinese file targeting Chinese is skipped without model calls', async () => {

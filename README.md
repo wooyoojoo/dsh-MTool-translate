@@ -87,10 +87,9 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
 
 **在界面里改**：设置 → 插件 → `dsh-mtool-translate`（点进 bundle 页面，表单在描述和插件行之间）→ 改完点「保存」，**下次翻译立即生效，不用重启**。
 
-页面上只有两项：
+页面上只有一项：
 
 - **推理强度**：`off` / `low` / `high` / `max`（默认 `low`）
-- **增量缓存**：保留 / 关闭（默认保留）
 
 其余都是代码里的固定值，故意不给旋钮：
 
@@ -104,18 +103,17 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
 
 保存的值落在 `~/.dsh/mtool-translate/settings.json`，改完下次翻译立即生效；点「恢复默认」清掉覆盖。也可以在对话里说「推理开 high」，助手用 `mtool_translate_config` 写同一个文件。
 
-YAML 里只有这两项可配：
+YAML 里只有这一项可配：
 
 ```yaml
 - id: mtool-translate
   config:
     reasoningEffort: low
-    cacheEnabled: true
 ```
 
 ### 增量缓存
 
-`.mtool-translate-cache.json` 是逐行对照表（`sha1(目标语言+原文) → 译文`），写在导出文件旁边。它只影响「下次再翻同一份/同一目录」，不影响 MTool 加载；关掉 `cacheEnabled` 后不再读写。删掉也安全，只是下次会重新付费翻译。注意它保存了译文原文，分享游戏目录时会一起带出去。
+`.mtool-translate-cache.json` 是逐行对照表（`sha1(目标语言+原文) → 译文`），写在导出文件旁边，**始终开启**。它只影响「下次再翻同一份/同一目录」，不影响 MTool 加载。翻完确认没问题后手动删掉即可——名词表也存在这个文件里，会一起清掉；留着的话下次打补丁重导出只为新增行付钱。注意它保存了译文原文，分享游戏目录时会一起带出去。
 
 ## 名词表
 
@@ -125,7 +123,6 @@ YAML 里只有这两项可配：
 - **过目**：抽完会把清单打给你。不满意的让助手改（`set`）或删（`remove`），例如「把 アイテム、エリア、ベッド 这几条去掉」。
 - **自动生效**：之后 `translate_mtool_file` 每次都会加载这张表，结果里会显示 `Glossary: N term(s) applied`。
 - **存哪儿**：就直接放在游戏目录的 **`.mtool-translate-cache.json` 里**（和译文缓存同一个文件，按目标语言分块）。选择这样是因为你只需要容忍一个残留文件：删掉 cache = 缓存和名词表一起清干净，不留别的。
-- 因为共用文件，**关掉增量缓存时名词表无法保存**（工具会直接提示），要留着表就把缓存开着。
 - 单次调用也可以用 `glossary` 参数临时补几条，优先级高于表里的同名词条。
 
 ## 限制
