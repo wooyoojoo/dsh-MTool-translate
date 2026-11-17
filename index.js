@@ -420,6 +420,51 @@ export function isPending(key, value, force = false) {
 }
 
 /**
+ * Tokens that only occur in shader or script source.
+ *
+ * MTool exports the GLSL/JS snippets a plugin embeds as if they were game text,
+ * and a model asked to translate them will happily localize `varying` and
+ * `vec2` — which breaks the effect instead of the dialogue.
+ */
+const CODE_TOKENS = /#version|precision\s+(?:lowp|mediump|highp)|\b(?:uniform|varying|attribute|sampler2D|texture2D|gl_FragColor|gl_Position|gl_FragCoord|vec[234]|mat[234]|smoothstep|fract)\b|\bvoid\s+main\b|\b(?:function|document|window|console)\s*[.(]|\bthis\.|=>|<\/?script|\b(?:background|padding|margin|border|font-family|font-size|font-weight|display|text-align)\s*[:\-]|data:[a-z]+\/|url\(/iu
+
+/** Whether a string still contains Japanese or Chinese text. */
+const CJK_TEXT = /[\u3040-\u30ff\u4e00-\u9fff]/u
+
+/** Characters that density-mark source code rather than prose. */
+const CODE_SYMBOLS = /[;{}()[\]=\-+*/%<>:#]/gu
+
+/** A bare token that only a statement would carry, without path separators. */
+const CODE_BARE_TOKEN = /[;{}()[\]=]/u
+
+/** A line that ends like a statement. */
+const CODE_STATEMENT_END = /[;{}]\s*$/mu
+
+/** A line holding nothing but a programming keyword. */
+const BARE_KEYWORD = /^\s*(?:function|return|const|let|var|class|new|this|typeof|instanceof|async|await|if|else|for|while|switch|case|break|continue|void|public|private|static)\s*$/u
+
+/**
+ * Whether a string is source code rather than game text.
+ *
+ * Ported in spirit from AiNiee's code filter, which it applies before any text
+ * reaches a model: a shader or markup token settles it, and otherwise a line
+ * with no Japanese or Chinese is treated as code when it holds a dense run of
+ * programming punctuation, or is a bare token like `float;`.
+ *
+ * @param text - one original string.
+ * @returns Whether the string must not be translated.
+ */
+export function looksLikeCode(text) {
+  if (typeof text !== 'string') return false
+  if (CODE_TOKENS.test(text)) return true
+  if (BARE_KEYWORD.test(text)) return true
+  if (CJK_TEXT.test(text)) return false
+  if (CODE_STATEMENT_END.test(text)) return true
+  if (!/\s/u.test(text) && CODE_BARE_TOKEN.test(text)) return true
+  return (text.match(CODE_SYMBOLS) ?? []).length >= 3
+}
+
+/**
  * Decide whether a string should reach the model at all.
  *
  * Ported from `general_text_filter.py`, plus a length guard and a whole-line
@@ -434,6 +479,12 @@ export function skipReason(text, exclusion = []) {
   // MTool's own metadata line must survive untouched; translating it breaks
   // the mode switch on load.
   if (text.startsWith('MTool_Meta_DO_NOT_REMOVE')) return 'mtool-meta'
+  // An explicit exclusion wins over every heuristic below: the user named that
+  // string, so a code marker inside it does not override their intent.
+  if (exclusion.some(entry => (entry.regex === true
+    ? (entry.pattern?.test(text) ?? false)
+    : text.trim() === entry.source.trim()))) return 'excluded'
+  if (looksLikeCode(text)) return 'code'
   if (text.length > MAX_LINE_CHARS) return 'too-long'
   if (/^\d+$/u.test(text)) return 'numeric'
   if (text.trim() === '') return 'empty'

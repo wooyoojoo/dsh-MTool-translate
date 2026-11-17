@@ -47,6 +47,7 @@ const {
   isPending,
   isChineseLanguage,
   lineDefect,
+  looksLikeCode,
   looksLikeOriginal,
   maskCodes,
   normalizeLineEndings,
@@ -215,6 +216,24 @@ check('a regex exclusion marker matches like build_re_pattern', () => {
 })
 check('MTool metadata is never translated', () => {
   assert.equal(skipReason('MTool_Meta_DO_NOT_REMOVE {"v":1}'), 'mtool-meta')
+})
+check('shader and script fragments are recognised as code', () => {
+  for (const text of [
+    'varying vec4 vColor;',
+    'precision highp float;',
+    'uniform sampler2D uSamplers',
+    'return this.data',
+    'background: #ff66a5; padding:5px 0;',
+    'float;',
+    'function',
+    'gl_FragColor = c;\r\n        return;',
+  ]) {
+    assert.equal(looksLikeCode(text), true, text)
+  }
+  for (const text of ['こんにちは、勇者さま。', 'はい', 'text:ううっ…', 'A: 你好']) {
+    assert.equal(looksLikeCode(text), false, text)
+  }
+  assert.equal(skipReason('varying vec4 vColor;'), 'code')
 })
 check('an entry counts as translated only when it differs from its key', () => {
   assert.equal(isPending('a', 'a'), true)
