@@ -1257,6 +1257,7 @@ export async function translateBatch(preparedBatch, context) {
   const { items, previous } = preparedBatch
   const done = new Map()
   const failures = []
+  const defects = new Map()
   let pending = items.slice()
   let lastError
 
@@ -1284,7 +1285,10 @@ export async function translateBatch(preparedBatch, context) {
       const translated = translations[index] ?? ''
       const defect = lineDefect(item, translated, options)
       if (defect !== undefined) {
-        lastError = new Error(`${defect} ${JSON.stringify(item.masked.slice(0, 40))}`)
+        // Record the defect against its own line: a batch-level retry used to
+        // report the last defect for every line, which mislabelled the cause.
+        defects.set(item.key, defect)
+        lastError = new Error(defect)
         still.push(item)
         return
       }
@@ -1316,8 +1320,12 @@ export async function translateBatch(preparedBatch, context) {
     }
   }
 
-  if (pending.length > 0 && failures.length === 0) {
-    for (const item of pending) failures.push({ item, reason: lastError?.message ?? 'not translated' })
+  if (pending.length > 0) {
+    const reported = new Set(failures.map(failure => failure.item.key))
+    for (const item of pending) {
+      if (reported.has(item.key)) continue
+      failures.push({ item, reason: defects.get(item.key) ?? lastError?.message ?? 'not translated' })
+    }
   }
   return { done, failures }
 }
