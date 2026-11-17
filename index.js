@@ -101,7 +101,7 @@ export const CODE_PATTERNS = [
   { source: '\\\\fb', description: '\\fb bold' },
   { source: '\\\\fi', description: '\\fi italic' },
   { source: '\\\\g', description: '\\G currency' },
-  { source: '\\\\\\$', description: '\\$ gold window' },
+  { source: '\\\\$', description: '\\$ gold window' },
   { source: '\\\\\\|', description: '\\| wait 1s' },
   { source: '\\\\\\.', description: '\\. wait 0.25s' },
   { source: '\\\\!', description: '\\! wait for input' },
@@ -142,6 +142,8 @@ export const CODE_PATTERNS = [
   { source: '\\\\n', description: 'literal \\n line break' },
   // Two consecutive real newlines are one structural unit; single \r last.
   { source: '(?:\\r?\\n){2}', description: 'double newline' },
+  { source: '\\{i\\}', description: '{i} combo tag' },
+  { source: '\\{/i\\}', description: '{/i} closing tag' },
   { source: '\\r', description: 'carriage return' },
 ].map(entry => ({ ...entry, pattern: new RegExp(entry.source, 'g') }))
 
@@ -167,10 +169,16 @@ const EXCLUDE_SUFFIX = new Set([
 const EXCLUDE_PREFIX = ['MapData/', 'SE/', 'BGS', '0=', 'BGM/', 'FIcon/', '<input type=', 'width:', '<div ', 'EV0', '\\img']
 
 /**
- * Characters that count as "the source language", used to strip code from the
- * edges of a line before translating (text_processor.py JAPANESE_CHAR_SET).
+ * Characters that count as "the source language", used to split a line into a
+ * translatable core and the code around it (text_processor.py JAPANESE_CHAR_SET).
  */
-const JAPANESE_CONTENT = /[\u3040-\u309F\u30A0-\u30FF\u30FB-\u30FE\uFF65-\uFF9F\u4E00-\u9FFF\u3400-\u4DBF\u3001-\u303F\uFF01-\uFF5E]/
+const JAPANESE_CLASS = '\\u3040-\\u309F\\u30A0-\\u30FF\\u30FB-\\u30FE\\uFF65-\\uFF9F\\u4E00-\\u9FFF\\u3400-\\u4DBF\\u3001-\\u303F\\uFF01-\\uFF5E'
+
+/** `^(\s*)(.*?)(\s*)$` — the whitespace-only affix rule (RE_WHITESPACE_AFFIX). */
+const RE_WHITESPACE_AFFIX = /^(\s*)([\s\S]*?)(\s*)$/u
+
+/** The Japanese affix rule (RE_JA_AFFIX): everything outside the Japanese ranges. */
+const RE_JA_AFFIX = new RegExp(`^([^${JAPANESE_CLASS}]*)([\\s\\S]*?)([^${JAPANESE_CLASS}]*)$`, 'u')
 
 /** Japanese kana, used by the residual-original check (advanced_checks.py). */
 const KANA = /[\u3041-\u3096\u30A0-\u30FF]+/gu
@@ -241,6 +249,7 @@ export function resolveConfig(config) {
     timeoutMs: integer('timeoutMs', DEFAULT_TIMEOUT_MS, 1000),
     maxTokens: integer('maxTokens', DEFAULT_MAX_TOKENS, 256),
     limit: integer('limit', 0, 0),
+    previousLines: integer('previousLines', 0, 0),
     outputDir: raw.outputDir,
     glossary: raw.glossary,
     exclusion: raw.exclusion ?? [],
@@ -310,6 +319,9 @@ export function isPending(key, value, force = false) {
  */
 export function skipReason(text, exclusion = []) {
   if (typeof text !== 'string') return 'not-a-string'
+  // MTool's own metadata line must survive untouched; translating it breaks
+  // the mode switch on load.
+  if (text.startsWith('MTool_Meta_DO_NOT_REMOVE')) return 'mtool-meta'
   if (text.length > MAX_LINE_CHARS) return 'too-long'
   if (/^\d+$/u.test(text)) return 'numeric'
   if (text.trim() === '') return 'empty'
@@ -383,22 +395,256 @@ export function applyReplacements(text, rules) {
 }
 
 /**
- * Strip the code segments that sit outside the Japanese text.
+ * Normalize line breaks to `\n`, remembering what each one was.
  *
- * Ported from `text_processor.strip_and_record_affixes`: a leading and trailing
- * run with no Japanese character is code or decoration, so it travels with the
- * line untouched and only the core reaches the model.
+ * Ported from `text_processor._normalize_line_endings`: `<br>` tags, CRLF, CR
+ * and LF all become one break, and the original form is kept so the finished
+ * text can put it back.
  *
  * @param text - one original string.
- * @returns The core text and the pieces to put back around it.
+ * @returns The normalized text and the break kinds in order.
  */
-export function stripAffixes(text) {
-  if (text === '') return { core: '', prefix: '', suffix: '' }
-  const first = text.search(JAPANESE_CONTENT)
-  if (first < 0) return { core: text, prefix: '', suffix: '' }
-  let last = text.length - 1
-  while (last > first && !JAPANESE_CONTENT.test(text[last])) last -= 1
-  return { core: text.slice(first, last + 1), prefix: text.slice(0, first), suffix: text.slice(last + 1) }
+export function normalizeLineEndings(text) {
+  const endings = []
+  let out = ''
+  let index = 0
+  while (index < text.length) {
+    if (text.slice(index, index + 3).toLowerCase() === '<br') {
+      const close = text.indexOf('>', index)
+      if (close !== -1) {
+        endings.push(text.slice(index, close + 1))
+        out += '\n'
+        index = close + 1
+        continue
+      }
+    }
+    if (text.slice(index, index + 2) === '\r\n') {
+      endings.push('\r\n')
+      out += '\n'
+      index += 2
+      continue
+    }
+    if (text[index] === '\r') {
+      endings.push('\r')
+      out += '\n'
+      index += 1
+      continue
+    }
+    if (text[index] === '\n') {
+      endings.push('\n')
+      out += '\n'
+      index += 1
+      continue
+    }
+    out += text[index]
+    index += 1
+  }
+  return { text: out, endings }
+}
+
+/**
+ * Whether a fragment is only ASCII letters and spaces.
+ *
+ * Ported from `text_processor._is_pure_english`.
+ *
+ * @param text - the fragment.
+ * @returns Whether it is pure English.
+ */
+export function isPureEnglish(text) {
+  if (text === '' || text.trim() === '') return false
+  return [...text].every(char => (/[A-Za-z]/.test(char) && char.charCodeAt(0) < 0x80) || /\s/.test(char))
+}
+
+/**
+ * Move bracket edges and short fragments back next to the core.
+ *
+ * Ported from `text_processor._handle_special_characters`: an opening bracket
+ * belongs with the text it opens, a closing bracket with the text it closes, a
+ * digit run is a label, and a pure-English fragment is probably part of the
+ * sentence rather than decoration.
+ *
+ * @param prefix - the leading fragment.
+ * @param core - the translatable text.
+ * @param suffix - the trailing fragment.
+ * @returns The adjusted triple.
+ */
+export function handleSpecialCharacters(prefix, core, suffix) {
+  let head = prefix
+  let body = core
+  let tail = suffix
+
+  if (head.endsWith('[')) { body = `[${body}`; head = head.slice(0, -1) }
+  else if (head.endsWith('{')) { body = `{${body}`; head = head.slice(0, -1) }
+  else if (head.endsWith('（')) { body = `（${body}`; head = head.slice(0, -1) }
+  else if (head.endsWith('(')) { body = `(${body}`; head = head.slice(0, -1) }
+
+  if (tail.startsWith(']')) { body = `${body}]`; tail = tail.slice(1) }
+  else if (tail.startsWith('}')) { body = `${body}}`; tail = tail.slice(1) }
+  else if (tail.startsWith('）')) { body = `${body}）`; tail = tail.slice(1) }
+  else if (tail.startsWith(')')) { body = `${body})`; tail = tail.slice(1) }
+
+  if (tail !== '' && /^\d+$/u.test(tail)) { body += tail; tail = '' }
+
+  if (head !== '' && isPureEnglish(head)) { body = head + body; head = '' }
+  if (tail !== '' && isPureEnglish(tail)) { body += tail; tail = '' }
+
+  return { prefix: head, core: body, suffix: tail }
+}
+
+/**
+ * Split one line into the part worth translating and the code around it.
+ *
+ * Ported from `text_processor._process_multiline_text`: the Japanese mode keeps
+ * everything outside the Japanese ranges as affix; the whitespace mode only
+ * keeps surrounding whitespace.
+ *
+ * @param line - one line.
+ * @param jaMode - whether the source is Japanese.
+ * @returns The line's parts, or `empty` for a blank line.
+ */
+export function splitLineAffix(line, jaMode) {
+  if (line === '' || line.trim() === '') {
+    return { empty: true, whitespace: line, prefix: '', core: '', suffix: '' }
+  }
+  const match = (jaMode ? RE_JA_AFFIX : RE_WHITESPACE_AFFIX).exec(line)
+  if (match === null) return { empty: false, prefix: '', core: line, suffix: '' }
+
+  let prefix = match[1]
+  let core = match[2]
+  let suffix = match[3]
+  const adjusted = handleSpecialCharacters(prefix, core, suffix)
+  prefix = adjusted.prefix
+  core = adjusted.core
+  suffix = adjusted.suffix
+
+  if (core.trim() === '' && line.trim() !== '') {
+    prefix = ''
+    core = line
+    suffix = ''
+  }
+
+  if (/^\d+$/u.test(prefix.trim())) {
+    const leading = prefix.slice(0, prefix.length - prefix.trimStart().length)
+    core = prefix.slice(leading.length) + core
+    prefix = leading
+  }
+  if (/^\d+$/u.test(suffix.trim())) {
+    const trailing = suffix.slice(suffix.trimEnd().length)
+    core = core + suffix.slice(0, suffix.length - trailing.length)
+    suffix = trailing
+  }
+
+  return { empty: false, prefix, core, suffix }
+}
+
+/**
+ * Prepare one string for the model.
+ *
+ * Ported from `text_processor.strip_and_record_affixes`: normalize the breaks,
+ * drop blank lines from the payload, and record every line's affixes so the
+ * finished text can be rebuilt exactly.
+ *
+ * @param text - one original string.
+ * @param options - `jaMode`.
+ * @returns The payload plus what `restoreText` needs.
+ */
+export function prepareText(text, options = {}) {
+  const normalized = normalizeLineEndings(text)
+  const lines = normalized.text.split('\n')
+  const infos = lines.map(line => splitLineAffix(line, options.jaMode === true))
+  const payload = infos.filter(info => info.empty === false).map(info => info.core).join('\n')
+  return { payload, infos, endings: normalized.endings }
+}
+
+/**
+ * Rebuild one string from its translation.
+ *
+ * Ported from `text_processor._restore_multiline_text`.
+ *
+ * @param translated - the translated payload.
+ * @param prepared - the value `prepareText` returned.
+ * @returns The text with affixes and original line breaks back.
+ */
+export function restoreText(translated, prepared) {
+  const lines = String(translated ?? '').split('\n')
+  const out = []
+  let index = 0
+  for (const info of prepared.infos) {
+    if (info.empty === true) {
+      out.push(info.whitespace)
+      continue
+    }
+    out.push(info.prefix + (lines[index] ?? '') + info.suffix)
+    index += 1
+  }
+  let joined = out[0] ?? ''
+  for (let next = 1; next < out.length; next += 1) {
+    joined += (prepared.endings[next - 1] ?? '\n') + out[next]
+  }
+  return joined
+}
+
+/**
+ * Guard a leading `1.` so the model does not read it as a list number.
+ *
+ * Ported from `text_processor.digital_sequence_preprocessing`: `1.标题`
+ * becomes `【1】标题` before the request.
+ *
+ * @param text - the payload.
+ * @returns The payload with the label bracketed.
+ */
+export function digitalSequence(text) {
+  return text.replace(/^(\d+)\./u, '【$1】')
+}
+
+/**
+ * Undo `digitalSequence`.
+ *
+ * @param text - the translated payload.
+ * @returns The label restored.
+ */
+export function digitalSequenceRestore(text) {
+  return text.replace(/^【(\d+)】/u, '$1.')
+}
+
+/**
+ * Strip control codes that sit at the very edges of the payload.
+ *
+ * Ported from `text_processor._process_affixes`: repeated prefix matches are
+ * removed from the front, and matches that end exactly at the end are removed
+ * from the back. Codes inside the text are handled later by `maskCodes`.
+ *
+ * @param payload - the prepared payload.
+ * @returns The trimmed text and the codes to put back.
+ */
+export function stripCodeAffixes(payload) {
+  const prefixes = []
+  const suffixes = []
+  let text = payload
+  for (const { pattern } of CODE_PATTERNS) {
+    for (;;) {
+      pattern.lastIndex = 0
+      const match = pattern.exec(text)
+      if (match === null || match.index !== 0 || match[0] === '') break
+      prefixes.push(match[0])
+      text = text.slice(match[0].length)
+    }
+  }
+  for (const { pattern } of CODE_PATTERNS) {
+    for (;;) {
+      // `matchAll` starts at the pattern's `lastIndex`, which an earlier `exec`
+      // may have left mid-string; without this reset a trailing code is skipped.
+      pattern.lastIndex = 0
+      let best = null
+      for (const match of text.matchAll(pattern)) {
+        if (match[0] !== '' && match.index + match[0].length === text.length) best = match
+      }
+      if (best === null) break
+      suffixes.unshift(best[0])
+      text = text.slice(0, best.index)
+    }
+  }
+  return { text, prefixes, suffixes }
 }
 
 /**
@@ -570,33 +816,95 @@ export function attachGlossary(items, glossary) {
 export function buildSystemPrompt(options) {
   const { target, sourceLanguage, glossary = [], exclusion = [] } = options
   const lines = [
-    `你是一名专业的游戏本地化译者。把${sourceLanguage}文本逐行翻译成${target}。`,
-    '逐行翻译，不要合并；原样保留序号、标记符、占位符（形如 [P1]）、换行符、转义符等特殊内容，保持原来的格式。',
+    `你是一名专业的翻译家，你的任务是把${sourceLanguage}文本翻译成${target}，逐行翻译，不要合并，原始保留文本中序号、标记符、占位符、换行符、转义符、代码调用过程等特殊内容，保持原来的格式。`,
     '',
     '### 翻译原则',
-    '忠实准确地进行翻译。原作是艺术作品，允许使用直白或粗俗的描述，不应随意删减或篡改，不应回避或淡化，以保持作品的原貌。',
-    '译文中不要出现解释、注释或原文读音；角色名、地名、道具名前后保持一致。',
+    '忠实准确地进行翻译。原作是伟大艺术作品，允许使用直白或粗俗的描述，不应随意删减或篡改，不应回避或淡化，以保持作品的原貌。',
   ]
+  // Appended the way `generate_prompt` appends the project tables.
   if (glossary.length > 0) {
-    lines.push('', '### 术语表，必须严格使用以下译法', '原文|译文')
-    for (const entry of glossary) lines.push(`${entry.source}|${entry.target}`)
+    lines.push('', '###术语表', '原文|译文|备注')
+    for (const entry of glossary) lines.push(`${entry.source}|${entry.target}| `)
   }
   if (exclusion.length > 0) {
-    lines.push('', '### 禁翻表，以下原文保持不变', '原文')
-    for (const term of exclusion) lines.push(term)
+    lines.push('', '###禁翻表，以下原文保持不变', '原文|备注')
+    for (const term of exclusion) lines.push(`${term}|`)
   }
-  lines.push('', '### 以 textarea 标签输出译文', '<textarea>', `1.${target}文本`, '</textarea>')
+  lines.push('', '### 以textarea标签输出译文', '<textarea>', `1.${target}文本`, '</textarea>')
   return lines.join('\n')
 }
 
 /**
- * Compose the user message: numbered source lines.
+ * Compose the numbered source block.
+ *
+ * Ported from `prompt_builder.build_source_text`: a single-line item is `N.text`,
+ * and a multi-line item becomes a bracketed block whose rows carry a
+ * `N.total-sub` sub-number, so a text box cannot be mistaken for several items.
+ *
+ * @param items - work items carrying `masked`.
+ * @returns The numbered source text.
+ */
+export function buildSourceText(items) {
+  return items.map((item, index) => {
+    const number = index + 1
+    const text = String(item.masked ?? '')
+    if (!text.includes('\n')) return `${number}.${text}`
+    const lines = text.split('\n')
+    const total = lines.length
+    const rows = lines.map((line, sub) => {
+      // AiNiee drops one trailing space when it is the only trailing whitespace.
+      const adjusted = /.*[^ ] $/u.test(line) ? line.slice(0, -1) : line
+      return `"${number}.${total - sub}.,${adjusted}",`
+    })
+    return `${number}.[\n${rows.join('\n').replace(/,$/u, '')}\n]`
+  }).join('\n')
+}
+
+/**
+ * Read one bracketed multi-line block back into its lines.
+ *
+ * Ported from `response_extractor.extract_multiline_content`, reduced to the
+ * row form this plugin emits: `"N.k.,text",`.
+ *
+ * @param body - the block body including its brackets.
+ * @returns The item's lines joined by a newline.
+ */
+export function parseBracketBlock(body) {
+  const inner = body.slice(1, -1)
+  const rows = []
+  for (const raw of inner.split('\n')) {
+    let line = raw.trim()
+    if (line === '') continue
+    line = line.replace(/^["“]/u, '')
+    line = line.replace(/["”],?$/u, '')
+    line = line.replace(/^\d+\.\d+\.,?\s*/u, '')
+    rows.push(line)
+  }
+  if (rows.length === 1 && /["“”]\s*,\s*["“”]/u.test(inner)) {
+    return inner.split(/["“”]\s*,\s*["“”]/u).map(part => part
+      .replace(/^["“]/u, '')
+      .replace(/["”],?$/u, '')
+      .replace(/^\d+\.\d+\.,?\s*/u, '')
+      .trim()).join('\n')
+  }
+  return rows.join('\n')
+}
+
+/**
+ * Compose the user message: optional context, the task line, and the numbered
+ * source inside a `<textarea>`, exactly as `generate_prompt` builds it.
  *
  * @param batch - work items carrying `masked`.
+ * @param options - `previous` source lines, used as context.
  * @returns The user message.
  */
-export function buildUserPrompt(batch) {
-  return batch.map((item, index) => `${index + 1}.${item.masked}`).join('\n')
+export function buildUserPrompt(batch, options = {}) {
+  const numbered = buildSourceText(batch)
+  const previous = options.previous ?? []
+  const head = previous.length > 0
+    ? `###上文内容\n<previous>\n${previous.join('\n')}\n</previous>\n`
+    : ''
+  return `${head} ###这是你接下来的翻译任务，原文文本如下\n<textarea>\n${numbered}\n</textarea>`
 }
 
 /**
@@ -630,7 +938,13 @@ export function extractTranslation(reply) {
       continue
     }
     started = true
-    items.push(match[2].trim())
+    // `base_checks.check_dict_order`: a reply whose numbers are not 1..n in
+    // order has slid a line, so every later mapping would be wrong.
+    if (Number(match[1]) !== items.length + 1) {
+      throw new Error(`【行数错误】 - 出现错行串行 (期望 ${items.length + 1}，实际 ${match[1]})`)
+    }
+    const payload = match[2].trim()
+    items.push(payload.startsWith('[') && payload.endsWith(']') ? parseBracketBlock(payload) : payload)
   }
   if (items.length === 0) throw new Error(`reply carried no numbered lines: ${trimmed.slice(0, 200)}`)
   return items
@@ -675,8 +989,9 @@ export function readReply(reply, expected) {
     try {
       const items = extract(reply)
       if (items.length === expected) return items
+      // A count mismatch means every later line would be attributed to the
+      // wrong source, so this is a retry, not a truncation.
       firstError ??= new Error(`reply had ${items.length} lines, expected ${expected}`)
-      if (items.length > expected) return items.slice(0, expected)
     } catch (error) {
       firstError ??= error
     }
@@ -935,18 +1250,19 @@ export async function complete(llm, route, system, user, signal) {
  * @param context - llm, route, prompts, target, retry budget, signal.
  * @returns Translated lines by source text, plus the failures.
  */
-export async function translateBatch(batch, context) {
+export async function translateBatch(preparedBatch, context) {
   const { llm, route, system, maxRetries, signal, onUsage, options } = context
+  const { items, previous } = preparedBatch
   const done = new Map()
   const failures = []
-  let pending = batch.slice()
+  let pending = items.slice()
   let lastError
 
   for (let attempt = 0; attempt <= maxRetries && pending.length > 0; attempt += 1) {
     if (signal?.aborted) throw new Error('cancelled')
     let reply
     try {
-      const result = await complete(llm, route, system, buildUserPrompt(pending), signal)
+      const result = await complete(llm, route, system, buildUserPrompt(pending, { previous }), signal)
       onUsage?.(result.usage)
       reply = result.text
     } catch (error) {
@@ -1045,27 +1361,46 @@ export async function runBatches(batches, context) {
  */
 export function prepareBatch(batch, options = {}) {
   const state = { counter: 0, entries: [] }
-  return batch.map((item) => {
+  const jaMode = isJapaneseSource(options.sourceLanguage)
+  const items = batch.map((item) => {
     const pre = applyReplacements(item.text, options.preReplace)
-    const affixes = stripAffixes(pre)
+    const prepared = prepareText(pre, { jaMode })
+    const stripped = stripCodeAffixes(prepared.payload)
+    const payload = digitalSequence(stripped.text)
     // Only the placeholders this line created: the counter is shared by the
     // batch, so slicing from the current end keeps the per-line restoration
     // list from inheriting the lines that came before it.
     const start = state.entries.length
-    const masked = maskCodes(affixes.core, state)
+    const masked = maskCodes(payload, state)
     const placeholders = state.entries.slice(start)
+    const sourceCore = digitalSequenceRestore(payload)
     return {
       ...item,
       masked,
       placeholders,
       restore(translated) {
+        // Mirror `text_processor.restore_all`, in the same order.
         let out = unmaskCodes(translated, placeholders)
-        out = options.postReplace === undefined ? out : applyReplacements(out, options.postReplace)
-        if (options.symbolRepair !== false) out = repairSymbols(affixes.core, out)
-        return affixes.prefix + out + affixes.suffix
+        out = stripped.prefixes.join('') + out + stripped.suffixes.join('')
+        if (options.postReplace !== undefined) out = applyReplacements(out, options.postReplace)
+        out = digitalSequenceRestore(out)
+        if (options.symbolRepair !== false) out = repairSymbols(sourceCore, out)
+        return restoreText(out, prepared)
       },
     }
   })
+  return { previous: options.previous ?? [], items }
+}
+
+/**
+ * Whether the configured source language is Japanese.
+ *
+ * @param language - the config value.
+ * @returns Whether the Japanese affix rule applies.
+ */
+export function isJapaneseSource(language) {
+  if (typeof language !== 'string') return true
+  return ['ja', 'japanese', '日语', '日文', '日本語', '日本语'].includes(language.trim().toLowerCase())
 }
 
 /**
@@ -1301,7 +1636,12 @@ export async function executeTranslate(ctx, config, args, signal) {
     glossary,
     exclusion,
   })
-  const prepared = toRun.map(batch => prepareBatch(batch, config))
+  const prepared = toRun.map((batch, index) => {
+    const previous = config.previousLines > 0 && index > 0
+      ? batches[index - 1].slice(-config.previousLines).map(item => item.text)
+      : []
+    return prepareBatch(batch, { ...config, previous })
+  })
 
   for (const item of items) {
     if (item.cached !== undefined) entries[item.key] = item.cached

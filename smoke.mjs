@@ -16,23 +16,29 @@ import { join } from 'node:path'
 
 import {
   buildBatches,
+  buildSourceText,
   cacheKey,
   CODE_PATTERNS,
   collectWork,
   countNewlines,
+  digitalSequence,
+  digitalSequenceRestore,
   executeTranslate,
   extractTranslation,
   isPending,
   lineDefect,
   looksLikeOriginal,
   maskCodes,
+  normalizeLineEndings,
   parseJsonReply,
   prepareBatch,
+  prepareText,
   readReply,
   repairSymbols,
   resolveConfig,
+  restoreText,
   skipReason,
-  stripAffixes,
+  stripCodeAffixes,
   unmaskCodes,
 } from './index.js'
 
@@ -71,10 +77,12 @@ function stubLlm(translate, options = {}) {
     calls,
     stream(request) {
       const user = request.messages[0].content[0].text
-      const lines = user.split('\n').map(line => line.replace(/^\d+\./u, ''))
-      calls.push(lines)
-      const out = lines.map((text, index) => `${index + 1}.${translate(text, index, calls.length)}`)
-      const reply = `<textarea>\n${out.join('\n')}\n</textarea>`
+      // The user message wraps the source in <textarea>, like AiNiee's does.
+      const body = /<textarea>([\s\S]*)<\/textarea>/u.exec(user)?.[1] ?? user
+      const sourceItems = extractTranslation(body)
+      calls.push(sourceItems)
+      const translated = sourceItems.map((text, index) => translate(text, index, calls.length))
+      const reply = `<textarea>\n${buildSourceText(translated.map(masked => ({ masked })))}\n</textarea>`
       return (async function* () {
         yield { type: 'text-delta', index: 0, text: options.wrap === undefined ? reply : options.wrap(reply) }
         yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
@@ -115,10 +123,52 @@ check('the counter is shared across a batch, so moving a code across lines fails
   maskCodes('\\C[2]乙', state)
   assert.deepEqual(state.entries.map(entry => entry.placeholder), ['[P1]', '[P2]'])
 })
-check('affixes outside the Japanese core are stripped and kept', () => {
-  assert.deepEqual(stripAffixes('[SFX]\\C[3]こんにちは！'), { core: 'こんにちは！', prefix: '[SFX]\\C[3]', suffix: '' })
-  assert.deepEqual(stripAffixes('こんにちは (1)'), { core: 'こんにちは', prefix: '', suffix: ' (1)' })
-  assert.deepEqual(stripAffixes('ABC'), { core: 'ABC', prefix: '', suffix: '' })
+check('affixes outside the Japanese core are stripped and restored', () => {
+  const prepared = prepareText('[SFX]\\C[3]こんにちは！', { jaMode: true })
+  assert.equal(prepared.payload, 'こんにちは！')
+  assert.equal(prepared.infos[0].prefix, '[SFX]\\C[3]')
+  assert.equal(restoreText('你好！', prepared), '[SFX]\\C[3]你好！')
+})
+check('a pure-English affix stays in the translatable text', () => {
+  const prepared = prepareText('abc こんにちは', { jaMode: true })
+  assert.equal(prepared.payload, 'abc こんにちは')
+  assert.equal(prepared.infos[0].prefix, '')
+})
+check('line breaks are normalized and restored in their original form', () => {
+  const prepared = prepareText('おはよう\r\nこんばんは', { jaMode: true })
+  assert.equal(prepared.payload, 'おはよう\nこんばんは')
+  assert.equal(restoreText('早上好\n晚上好', prepared), '早上好\r\n晚上好')
+  assert.equal(normalizeLineEndings('a<br>b').text, 'a\nb')
+})
+check('blank lines are dropped from the payload and put back', () => {
+  const prepared = prepareText('一行目\n\n二行目', { jaMode: true })
+  assert.equal(prepared.payload, '一行目\n二行目')
+  assert.equal(restoreText('甲\n乙', prepared), '甲\n\n乙')
+})
+check('a leading list number is bracketed so the reply keeps numbering clean', () => {
+  assert.equal(digitalSequence('1.これは'), '【1】これは')
+  assert.equal(digitalSequenceRestore('【1】这是'), '1.这是')
+})
+check('a multi-line item becomes a bracketed sub-numbered block and comes back', () => {
+  const items = [
+    { masked: '一行目' },
+    { masked: 'スキル１番は［攻撃］コマンドを\n選択したときに使用されます。' },
+  ]
+  const source = buildSourceText(items)
+  assert.equal(
+    source,
+    '1.一行目\n2.[\n"2.2.,スキル１番は［攻撃］コマンドを",\n"2.1.,選択したときに使用されます。"\n]',
+  )
+  assert.deepEqual(extractTranslation(source), [
+    '一行目',
+    'スキル１番は［攻撃］コマンドを\n選択したときに使用されます。',
+  ])
+})
+check('edge codes are stripped from the payload and reattached', () => {
+  const stripped = stripCodeAffixes('\\C[3]勇者\\C[0]')
+  assert.equal(stripped.text, '勇者')
+  assert.deepEqual(stripped.prefixes, ['\\C[3]'])
+  assert.deepEqual(stripped.suffixes, ['\\C[0]'])
 })
 
 console.log('ported skip rules (general_text_filter.py)')
@@ -134,6 +184,9 @@ check('the obvious non-translatable shapes are skipped', () => {
 check('the exclusion list skips an exact line', () => {
   assert.equal(skipReason('艾莉丝', ['艾莉丝']), 'excluded')
   assert.equal(skipReason('艾莉丝大人', ['艾莉丝']), undefined)
+})
+check('MTool metadata is never translated', () => {
+  assert.equal(skipReason('MTool_Meta_DO_NOT_REMOVE {"v":1}'), 'mtool-meta')
 })
 check('an entry counts as translated only when it differs from its key', () => {
   assert.equal(isPending('a', 'a'), true)
@@ -157,6 +210,12 @@ check('JSON is accepted as a fallback', () => {
 check('readReply prefers the numbered protocol and reports a count mismatch', () => {
   assert.deepEqual(readReply('<textarea>1.甲\n2.乙</textarea>', 2), ['甲', '乙'])
   assert.throws(() => readReply('<textarea>1.甲</textarea>', 3), /expected 3/)
+})
+check('a reply with extra lines is a retry, not a truncation', () => {
+  assert.throws(() => readReply('<textarea>1.甲\n2.乙\n3.丙</textarea>', 2), /expected 2/)
+})
+check('out-of-order numbering is rejected like check_dict_order', () => {
+  assert.throws(() => extractTranslation('<textarea>1.甲\n3.乙</textarea>'), /错行串行/)
 })
 
 console.log('ported line checks (advanced_checks.py + response_checker.py)')
@@ -188,13 +247,13 @@ check('ellipsis and question mark are repaired', () => {
 
 console.log('batch preparation')
 check('prepare and restore round-trips a line', () => {
-  const [prepared] = prepareBatch([{ key: 'k', text: '\\C[3]勇者\\C[0]だ' }], { symbolRepair: true })
+  const { items: [prepared] } = prepareBatch([{ key: 'k', text: '\\C[3]勇者\\C[0]だ' }], { symbolRepair: true })
   // The leading colour code is an affix, so only the inner code is masked.
   assert.equal(prepared.masked, '勇者[P1]だ')
   assert.equal(prepared.restore('译勇者[P1]だ'), '\\C[3]译勇者\\C[0]だ')
 })
 check('placeholders do not leak from one line to the next in a batch', () => {
-  const prepared = prepareBatch([
+  const { items: prepared } = prepareBatch([
     { key: 'a', text: 'あ\\C[1]い' },
     { key: 'b', text: 'はい' },
   ], { symbolRepair: true })
