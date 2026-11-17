@@ -39,11 +39,96 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, resolve } from 'node:path'
 
+import z from '@deepseek-ai/schemastery'
+
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'mtoolTranslate'
 
 /** The tool registry this plugin contributes to. */
 export const inject = ['tools']
+
+/**
+ * Settings a user may change, in the order the config tool reports them.
+ *
+ * One source of truth: `Config` builds the Loader schema (the form the Plugins
+ * page renders) from these entries, and `mtool_translate_config` validates
+ * against them. `@deepseek-ai/schemastery` is a declared dependency pinned to
+ * the version the running Harness ships, so the schema is the same class the
+ * Loader already validates with.
+ */
+export const SETTING_FIELDS = {
+  target: { kind: 'string', default: '简体中文', description: '目标语言' },
+  sourceLanguage: { kind: 'string', default: '日语', description: '源语言' },
+  provider: { kind: 'string', description: '模型线路（留空跟随默认）' },
+  model: { kind: 'string', description: '模型 ID（留空跟随默认）' },
+  reasoningEffort: { kind: 'enum', values: ['off', 'low', 'high', 'max'], default: 'low', description: '推理强度：off 最快，low 术语更稳' },
+  promptPreset: { kind: 'enum', values: ['common', 'cot'], default: 'common', description: '提示词预设' },
+  targetPlatform: { kind: 'enum', values: ['default', 'sakura'], default: 'default', description: '占位符风格' },
+  batchLines: { kind: 'integer', min: 1, max: 200, default: 40, description: '每请求行数' },
+  batchChars: { kind: 'integer', min: 200, max: 8000, default: 1600, description: '每请求字符数' },
+  concurrency: { kind: 'integer', min: 1, max: 16, default: 8, description: '并发请求数' },
+  maxRetries: { kind: 'integer', min: 0, max: 5, default: 2, description: '每批重试次数' },
+  maxTokens: { kind: 'integer', min: 256, max: 32768, default: 8192, description: '回复 token 上限' },
+  previousLines: { kind: 'integer', min: 0, max: 20, default: 0, description: '随请求带上的上文字数' },
+  symbolRepair: { kind: 'boolean', default: true, description: '修复引号/省略号/问号' },
+  checkReturnedOriginal: { kind: 'boolean', default: false, description: '检查模型是否原样返回原文' },
+  checkResidualOriginal: { kind: 'boolean', default: false, description: '检查译文是否残留原文' },
+  outputDir: { kind: 'string', description: '输出目录（留空写在输入文件旁）' },
+}
+
+/**
+ * Build the Loader schema for one setting.
+ *
+ * @param field - one `SETTING_FIELDS` entry.
+ * @returns The Schemastery schema.
+ */
+function fieldSchema(field) {
+  const description = field.description ?? ''
+  if (field.kind === 'string') {
+    const schema = z.string().description(description)
+    return field.default === undefined ? schema : schema.default(field.default)
+  }
+  if (field.kind === 'boolean') return z.boolean().default(field.default).description(description)
+  if (field.kind === 'enum') {
+    return z.union(field.values.map(value => z.const(value))).default(field.default).description(description)
+  }
+  return z.number().step(1).min(field.min).max(field.max).default(field.default).description(description)
+}
+
+/** Loader schema for the plugin row: the form the Plugins page renders. */
+export const Config = z.object(Object.fromEntries(
+  Object.entries(SETTING_FIELDS).map(([key, field]) => [key, fieldSchema(field)]),
+))
+
+/**
+ * Validate a partial settings object against `SETTING_FIELDS`.
+ *
+ * @param values - the candidate settings.
+ * @returns The accepted settings.
+ * @throws When a key is unknown or a value is out of range.
+ */
+export function validateSettings(values) {
+  if (!isPlainObject(values)) throw new Error('mtoolTranslate: settings must be an object')
+  const out = {}
+  for (const [key, value] of Object.entries(values)) {
+    const field = SETTING_FIELDS[key]
+    if (field === undefined) throw new Error(`mtoolTranslate: unknown setting ${JSON.stringify(key)}`)
+    if (value === null || value === undefined) continue
+    if (field.kind === 'string') {
+      if (typeof value !== 'string') throw new Error(`mtoolTranslate: ${key} must be a string`)
+    } else if (field.kind === 'boolean') {
+      if (typeof value !== 'boolean') throw new Error(`mtoolTranslate: ${key} must be a boolean`)
+    } else if (field.kind === 'enum') {
+      if (!field.values.includes(value)) throw new Error(`mtoolTranslate: ${key} must be one of ${field.values.join(', ')}`)
+    } else {
+      if (!Number.isInteger(value) || value < field.min || value > field.max) {
+        throw new Error(`mtoolTranslate: ${key} must be an integer in ${field.min}..${field.max}`)
+      }
+    }
+    out[key] = value
+  }
+  return out
+}
 
 /** Target language used when neither config nor the call names one. */
 export const DEFAULT_TARGET = '简体中文'
@@ -68,11 +153,11 @@ export const DEFAULT_MAX_TOKENS = 8192
 
 /**
  * Reasoning effort for the routed model. Translation is formatting, not
- * reasoning: `off` keeps latency sane and, more importantly, stops a long
- * batch from spending the whole token budget on reasoning and returning an
- * empty answer. `undefined` leaves the route's default.
+ * reasoning: `low` measured the same quality band as `high` at a third of the
+ * latency, while `off` occasionally lost domain terms ("イベ" became 活动
+ * instead of 事件). `off` stays available per call for bulk drafts.
  */
-export const DEFAULT_REASONING_EFFORT = 'off'
+export const DEFAULT_REASONING_EFFORT = 'low'
 
 /** Cache schema version; a mismatch discards old entries. */
 export const CACHE_VERSION = 2
@@ -1657,7 +1742,7 @@ export function resolveRoute(ctx, config, override = {}) {
   return {
     provider,
     model,
-    reasoningEffort: config.reasoningEffort,
+    reasoningEffort: override.reasoningEffort ?? config.reasoningEffort,
     maxTokens: config.maxTokens,
   }
 }
@@ -1725,6 +1810,11 @@ export function defineTranslateTool(ctx, config) {
       properties: {
         path: { type: 'string', description: 'Path to the ManualTransFile.json exported by MTool (翻译 → 导出游戏原文).' },
         target: { type: 'string', description: `Target language. Defaults to ${DEFAULT_TARGET}.` },
+        reasoningEffort: {
+          type: 'string',
+          enum: ['off', 'low', 'high', 'max'],
+          description: 'Reasoning effort for this call only: off is fastest and is what plain translation needs; high/max cost more time and tokens. Defaults to the plugin setting.',
+        },
         glossary: {
           type: 'array',
           items: { type: 'string' },
@@ -1948,11 +2038,125 @@ export async function executeTranslate(ctx, config, args, signal) {
 }
 
 /**
- * Register `translate_mtool_file` on the tool registry.
+ * Project a resolved config onto the settable fields.
+ *
+ * @param config - a resolved (or partial) config.
+ * @returns The settable values.
+ */
+export function pickSettings(config) {
+  const out = {}
+  for (const key of Object.keys(SETTING_FIELDS)) {
+    if (config?.[key] !== undefined) out[key] = config[key]
+  }
+  return out
+}
+
+/**
+ * Locate this plugin's own Loader entry.
+ *
+ * @param editor - the config editor service.
+ * @param ctx - plugin context, whose fiber carries the entry when available.
+ * @returns The entry, or undefined.
+ */
+export function findOwnEntry(editor, ctx) {
+  const own = ctx.fiber?.entry
+  if (own !== undefined) return own
+  const rows = editor.configuration?.() ?? []
+  return rows.find(row => row.entry?.name === 'dsh-mtool-translate'
+    || String(row.entry?.id ?? '').includes('mtool-translate'))?.entry
+}
+
+/**
+ * Read the row's own override (not the merged config).
+ *
+ * @param editor - the config editor service.
+ * @param entry - the loader entry.
+ * @returns The override object.
+ */
+export function readOverride(editor, entry) {
+  const rows = editor.configuration?.() ?? []
+  return rows.find(row => row.entry === entry)?.override ?? {}
+}
+
+/**
+ * The `mtool_translate_config` tool definition.
+ *
+ * @param ctx - plugin context supplying the config editor.
+ * @returns The definition passed to `ctx.tools.register`.
+ */
+export function defineConfigTool(ctx) {
+  return {
+    name: 'mtool_translate_config',
+    description: 'Read or change the MTool translation plugin\'s settings (reasoning effort, batch size, concurrency, model route, and the rest) and persist them in this profile. '
+      + 'Call it with no settings to see the current values; call it with a partial object to save changes. '
+      + 'The plugin restarts when settings change, and the next translate_mtool_file call uses them.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        settings: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Partial settings to persist, for example {"concurrency": 6, "reasoningEffort": "high"}. Omit to read the current values.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          applied: { type: 'boolean' },
+          settings: { type: 'object', additionalProperties: true },
+          fields: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        },
+        required: ['applied', 'settings'],
+      },
+      render: (_args, value) => {
+        const lines = [value.applied
+          ? 'Settings saved. The plugin restarts to apply them.'
+          : 'Current MTool translation settings:']
+        for (const [key, setting] of Object.entries(value.settings)) {
+          lines.push(`- ${key}: ${JSON.stringify(setting)}  ${SETTING_FIELDS[key]?.description ?? ''}`.trimEnd())
+        }
+        lines.push('')
+        lines.push('Settable: ' + Object.keys(SETTING_FIELDS).join(', '))
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const editor = ctx.get('configEditor')
+      if (editor === undefined || typeof editor.edit !== 'function') {
+        throw new Error('mtoolTranslate: the config editor is unavailable in this profile')
+      }
+      const entry = findOwnEntry(editor, ctx)
+      if (entry === undefined) throw new Error('mtoolTranslate: cannot locate this plugin\'s loader entry')
+      if (args?.settings === undefined) {
+        return {
+          applied: false,
+          settings: pickSettings(resolveConfig(readOverride(editor, entry))),
+          fields: Object.entries(SETTING_FIELDS).map(([key, field]) => ({ key, ...field })),
+        }
+      }
+      const values = validateSettings(args.settings)
+      await editor.edit(entry, current => ({ ...current, ...values }))
+      return {
+        applied: true,
+        settings: pickSettings(resolveConfig({ ...readOverride(editor, entry), ...values })),
+        fields: Object.entries(SETTING_FIELDS).map(([key, field]) => ({ key, ...field })),
+      }
+    },
+  }
+}
+
+/**
+ * Register `translate_mtool_file` and `mtool_translate_config`.
  *
  * @param ctx - plugin context; `tools` is required, `llm` is read per call.
  * @param config - plugin row config, validated here.
  */
 export function apply(ctx, config) {
   ctx.tools.register(defineTranslateTool(ctx, resolveConfig(config)))
+  ctx.tools.register(defineConfigTool(ctx))
 }

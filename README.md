@@ -74,7 +74,9 @@ MTool 的收费翻译链路本来就是：导出原文 → 送翻 → 加载译�
 
 ## 配置
 
-`cordis.patch.yml` 里给插件行传 `config`，各项都可选：
+**优先在界面里改**：设置 → 插件 → `dsh-mtool-translate` → 配置，表单字段就是下面这些，改完插件自动重启生效。也可以直接跟助手说「把并发改成 6」「这次用 high 推理」，助手会调 `mtool_translate_config` 写进去。
+
+参数（YAML 里同样可用）：
 
 ```yaml
 - id: mtool-translate

@@ -10,11 +10,23 @@
  * exercised without spending a model call.
  */
 import assert from 'node:assert/strict'
+import { registerHooks } from 'node:module'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import {
+// The plugin imports `@deepseek-ai/schemastery` for its Loader Config; a bare
+// Node run cannot resolve the DSH installation, so the self-test stubs it.
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === '@deepseek-ai/schemastery') {
+      return { url: new URL('./schemastery-stub.mjs', import.meta.url).href, shortCircuit: true }
+    }
+    return nextResolve(specifier, context)
+  },
+})
+
+const {
   adjustParagraphQuotes,
   applyReplacements,
   buildBatches,
@@ -41,11 +53,12 @@ import {
   readReply,
   repairSymbols,
   resolveConfig,
+  resolveRoute,
   restoreText,
   skipReason,
   stripCodeAffixes,
   unmaskCodes,
-} from './index.js'
+} = await import('./index.js')
 
 let failures = 0
 let checks = 0

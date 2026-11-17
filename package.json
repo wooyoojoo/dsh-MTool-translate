@@ -5,6 +5,9 @@
   "description": "Translate MTool game-text exports (ManualTransFile.json) with the profile's own model and write a file MTool can load back.",
   "type": "module",
   "main": "index.js",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.19.0"
+  },
   "scripts": {
     "test": "node smoke.mjs"
   },

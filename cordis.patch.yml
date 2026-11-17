@@ -9,6 +9,6 @@
       name: dsh-mtool-translate
       config:
         target: 简体中文
-        reasoningEffort: off
+        reasoningEffort: low
         batchLines: 40
         concurrency: 8
