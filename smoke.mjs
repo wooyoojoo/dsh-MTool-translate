@@ -193,6 +193,17 @@ check('prepare and restore round-trips a line', () => {
   assert.equal(prepared.masked, '勇者[P1]だ')
   assert.equal(prepared.restore('译勇者[P1]だ'), '\\C[3]译勇者\\C[0]だ')
 })
+check('placeholders do not leak from one line to the next in a batch', () => {
+  const prepared = prepareBatch([
+    { key: 'a', text: 'あ\\C[1]い' },
+    { key: 'b', text: 'はい' },
+  ], { symbolRepair: true })
+  assert.equal(prepared[0].placeholders.length, 1)
+  assert.equal(prepared[0].masked, 'あ[P1]い')
+  assert.equal(prepared[1].placeholders.length, 0)
+  assert.equal(prepared[1].masked, 'はい')
+  assert.equal(prepared[1].restore('是'), '是')
+})
 
 console.log('config')
 check('defaults are filled and bad values rejected', () => {

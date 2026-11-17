@@ -1048,8 +1048,12 @@ export function prepareBatch(batch, options = {}) {
   return batch.map((item) => {
     const pre = applyReplacements(item.text, options.preReplace)
     const affixes = stripAffixes(pre)
+    // Only the placeholders this line created: the counter is shared by the
+    // batch, so slicing from the current end keeps the per-line restoration
+    // list from inheriting the lines that came before it.
+    const start = state.entries.length
     const masked = maskCodes(affixes.core, state)
-    const placeholders = state.entries.slice()
+    const placeholders = state.entries.slice(start)
     return {
       ...item,
       masked,
