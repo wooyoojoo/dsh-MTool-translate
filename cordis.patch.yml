@@ -9,4 +9,4 @@
       name: dsh-mtool-translate
       config:
         target: 简体中文
-        reasoningEffort: low
+        reasoningEffort: off

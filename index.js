@@ -49,7 +49,7 @@ export const inject = ['tools']
 export const DEFAULT_TARGET = '简体中文'
 
 /** Lines one model request may carry. */
-export const DEFAULT_BATCH_LINES = 30
+export const DEFAULT_BATCH_LINES = 20
 
 /** Source characters one model request may carry. */
 export const DEFAULT_BATCH_CHARS = 1200
@@ -64,13 +64,15 @@ export const DEFAULT_MAX_RETRIES = 2
 export const DEFAULT_TIMEOUT_MS = 900_000
 
 /** Output-token ceiling for one batch reply. */
-export const DEFAULT_MAX_TOKENS = 4096
+export const DEFAULT_MAX_TOKENS = 8192
 
 /**
  * Reasoning effort for the routed model. Translation is formatting, not
- * reasoning; `low` keeps latency sane while still resolving grammar.
+ * reasoning: `off` keeps latency sane and, more importantly, stops a long
+ * batch from spending the whole token budget on reasoning and returning an
+ * empty answer. `undefined` leaves the route's default.
  */
-export const DEFAULT_REASONING_EFFORT = 'low'
+export const DEFAULT_REASONING_EFFORT = 'off'
 
 /** Cache schema version; a mismatch discards old entries. */
 export const CACHE_VERSION = 2
