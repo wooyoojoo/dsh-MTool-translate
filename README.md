@@ -79,8 +79,8 @@ MTool 的收费翻译链路本来就是：导出原文 → 送翻 → 加载译�
     target: 简体中文
     sourceLanguage: 日语
     model: deepseek-flash      # 不填则跟随「设置」里的默认模型
-    reasoningEffort: low       # off | low | high | max
-    batchLines: 30
+    reasoningEffort: off       # off | low | high | max（翻译建议 off）
+    batchLines: 20
     batchChars: 1200
     concurrency: 3
     maxRetries: 2
