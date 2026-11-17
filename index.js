@@ -1050,66 +1050,59 @@ export async function resolveGlossary(value) {
   }
 }
 
-/** Directory under the state dir that holds one glossary per game. */
-export const GLOSSARY_DIR = 'glossaries'
-
 /**
- * Stable key for one game directory.
+ * Read the glossary stored in this game's translation cache.
  *
- * Keyed by the directory, not the file, so a re-export of the same game keeps
- * its glossary even though the file's contents changed.
+ * One file only: the glossary rides inside the `.mtool-translate-cache.json`
+ * the user already accepts, keyed by target language. Deleting that file
+ * forgets the glossary with it, which is what a one-shot workflow wants.
  *
- * @param projectDir - the directory holding `ManualTransFile.json`.
- * @returns A short hex key.
+ * @param projectDir - the game directory holding the cache.
+ * @param target - target language the glossary was written for.
+ * @returns The `{ source: target }` terms; empty when absent or for another language.
  */
-export function projectKey(projectDir) {
-  return createHash('sha1').update(resolve(projectDir), 'utf8').digest('hex').slice(0, 16)
+export async function readProjectGlossary(projectDir, target) {
+  let doc
+  try {
+    doc = JSON.parse(await readFile(join(projectDir, CACHE_FILE), 'utf8'))
+  } catch {
+    return {}
+  }
+  const block = doc?.glossary
+  if (!isPlainObject(block) || block.target !== target || !isPlainObject(block.terms)) return {}
+  const terms = {}
+  for (const [source, value] of Object.entries(block.terms)) {
+    if (isFilledString(source) && isFilledString(value)) terms[source] = value
+  }
+  return terms
 }
 
 /**
- * Read the glossary stored for one game.
+ * Store a glossary in this game's cache file, keeping its translation memory.
  *
- * @param stateDir - the plugin's state directory.
- * @param projectDir - the game directory.
- * @returns The glossary file path, the project path, and its terms.
- */
-export async function readProjectGlossary(stateDir, projectDir) {
-  const path = join(stateDir, GLOSSARY_DIR, `${projectKey(projectDir)}.json`)
-  let text
-  try {
-    text = await readFile(path, 'utf8')
-  } catch {
-    return { path, project: resolve(projectDir), terms: {} }
-  }
-  try {
-    const parsed = JSON.parse(text)
-    const terms = {}
-    for (const [source, target] of Object.entries(isPlainObject(parsed?.terms) ? parsed.terms : {})) {
-      if (isFilledString(source) && isFilledString(target)) terms[source] = target
-    }
-    return { path, project: resolve(projectDir), terms }
-  } catch {
-    return { path, project: resolve(projectDir), terms: {} }
-  }
-}
-
-/**
- * Persist the glossary for one game.
- *
- * @param stateDir - the plugin's state directory.
- * @param projectDir - the game directory.
+ * @param projectDir - the game directory holding the cache.
+ * @param target - target language the terms translate into.
  * @param terms - the complete `{ source: target }` map.
  * @returns The written path.
+ * @throws When the cache file exists but is not an object.
  */
-export async function writeProjectGlossary(stateDir, projectDir, terms) {
-  const path = join(stateDir, GLOSSARY_DIR, `${projectKey(projectDir)}.json`)
-  const body = {
-    version: 1,
-    project: resolve(projectDir),
-    updatedAt: new Date().toISOString(),
-    terms,
+export async function writeProjectGlossary(projectDir, target, terms) {
+  const path = join(projectDir, CACHE_FILE)
+  let doc = {}
+  try {
+    doc = JSON.parse(await readFile(path, 'utf8'))
+  } catch {
+    doc = {}
   }
-  await writeAtomic(path, `${JSON.stringify(body, null, 2)}\n`)
+  if (!isPlainObject(doc)) doc = {}
+  const next = {
+    ...doc,
+    version: CACHE_VERSION,
+    target: isFilledString(doc.target) ? doc.target : target,
+    entries: isPlainObject(doc.entries) ? doc.entries : {},
+    glossary: { target, terms },
+  }
+  await writeAtomic(path, JSON.stringify(next))
   return path
 }
 
@@ -1209,6 +1202,7 @@ export function defineGlossaryTool(ctx, config, runtime) {
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Path to the ManualTransFile.json of that game.' },
+        target: { type: 'string', description: 'Target language the terms translate into. Defaults to the plugin target (简体中文).' },
         action: { type: 'string', enum: ['list', 'build', 'set', 'remove'], description: 'What to do. Defaults to list.' },
         terms: {
           type: 'array',
@@ -1246,42 +1240,49 @@ export function defineGlossaryTool(ctx, config, runtime) {
       }
       const inputPath = resolve(args.path)
       const projectDir = dirname(inputPath)
-      const stored = await readProjectGlossary(runtime.stateDir, projectDir)
-      const terms = { ...stored.terms }
+      const settings = { ...config, ...(await readStoredSettings(runtime.stateDir)) }
+      const target = isFilledString(args.target) ? args.target : settings.target
+      const enabled = settings.cacheEnabled !== false
+      const terms = { ...(await readProjectGlossary(projectDir, target)) }
       const action = isFilledString(args.action) ? args.action : 'list'
+      const project = projectDir
+
+      const save = async () => {
+        if (!enabled) {
+          throw new Error('mtoolTranslate: 增量缓存已关闭；名词表和 .mtool-translate-cache.json 同文件，先在插件页打开缓存')
+        }
+        await writeProjectGlossary(projectDir, target, terms)
+        return { project, built: false, glossary: glossaryList(terms) }
+      }
 
       if (action === 'build') {
         const { entries } = await readManualTrans(inputPath)
         const candidates = extractTermCandidates(entries)
-        if (candidates.length === 0) {
-          return { project: stored.project, built: false, glossary: [] }
-        }
+        if (candidates.length === 0) return { project, built: false, glossary: [] }
         const llm = ctx.get?.('llm')
         if (llm === undefined || typeof llm.stream !== 'function') {
           throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
         }
         const route = resolveRoute(ctx, config, {})
-        const raw = await translateTerms(llm, route, candidates, config.target, exec.signal)
+        const raw = await translateTerms(llm, route, candidates, target, exec.signal)
         for (const entry of raw) terms[entry.source] = entry.target
-        await writeProjectGlossary(runtime.stateDir, projectDir, terms)
-        return { project: stored.project, built: true, glossary: glossaryList(terms) }
+        const saved = await save()
+        return { ...saved, built: true }
       }
 
       if (action === 'set') {
         for (const entry of normalizeGlossary(args.terms)) terms[entry.source] = entry.target
-        await writeProjectGlossary(runtime.stateDir, projectDir, terms)
-        return { project: stored.project, built: false, glossary: glossaryList(terms) }
+        return save()
       }
 
       if (action === 'remove') {
         for (const source of Array.isArray(args.terms) ? args.terms : []) {
           if (typeof source === 'string') delete terms[source.trim()]
         }
-        await writeProjectGlossary(runtime.stateDir, projectDir, terms)
-        return { project: stored.project, built: false, glossary: glossaryList(terms) }
+        return save()
       }
 
-      return { project: stored.project, built: false, glossary: glossaryList(terms) }
+      return { project, built: false, glossary: glossaryList(terms) }
     },
   }
 }
@@ -2127,14 +2128,14 @@ export function resolveOutput(inputPath, config, requested) {
  * @param explicit - a glossary passed to this call, or undefined.
  * @returns The glossary to apply, as `{ source, target }` pairs.
  */
-export async function mergeGlossary(runtime, inputPath, explicit) {
+export async function mergeGlossary(runtime, inputPath, target, explicit, enabled = true) {
   const merged = new Map()
-  if (runtime !== undefined) {
-    const stored = await readProjectGlossary(runtime.stateDir, dirname(inputPath))
-    for (const [source, target] of Object.entries(stored.terms)) merged.set(source, target)
+  if (runtime !== undefined && enabled !== false) {
+    const stored = await readProjectGlossary(dirname(inputPath), target)
+    for (const [source, value] of Object.entries(stored)) merged.set(source, value)
   }
   for (const entry of await resolveGlossary(explicit)) merged.set(entry.source, entry.target)
-  return [...merged].map(([source, target]) => ({ source, target }))
+  return [...merged].map(([source, value]) => ({ source, target: value }))
 }
 
 /**
@@ -2300,7 +2301,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
   }
   const route = dryRun ? { provider: 'dry-run', model: 'dry-run' } : resolveRoute(ctx, config, args)
-  const glossary = await mergeGlossary(runtime, inputPath, args.glossary ?? config.glossary)
+  const glossary = await mergeGlossary(runtime, inputPath, target, args.glossary ?? config.glossary, config.cacheEnabled)
   const exclusion = compileExclusion(config.exclusion)
 
   const { path: outputPath, cachePath } = resolveOutput(inputPath, config, args.outputPath)

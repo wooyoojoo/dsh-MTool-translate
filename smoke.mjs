@@ -426,14 +426,21 @@ try {
     assert.equal(names.includes('おはよう'), false)
   })
 
-  await checkAsync('the per-game glossary round-trips, and an explicit term wins', async () => {
-    const stateDir = join(dir, 'state')
+  await checkAsync('the glossary lives in the cache file and an explicit term wins', async () => {
     const gameDir = join(dir, 'game')
     await mkdir(gameDir, { recursive: true })
-    await writeProjectGlossary(stateDir, gameDir, { アリス: '爱丽丝', エルフ: '精灵' })
-    const stored = await readProjectGlossary(stateDir, gameDir)
-    assert.equal(stored.terms.アリス, '爱丽丝')
-    const merged = await mergeGlossary({ stateDir }, join(gameDir, 'ManualTransFile.json'), ['アリス=>艾莉丝'])
+    const cachePath = join(gameDir, '.mtool-translate-cache.json')
+    await writeFile(cachePath, JSON.stringify({ version: 2, target: '简体中文', entries: { abc: '甲' } }))
+    await writeProjectGlossary(gameDir, '简体中文', { アリス: '爱丽丝', エルフ: '精灵' })
+    const stored = await readProjectGlossary(gameDir, '简体中文')
+    assert.equal(stored.アリス, '爱丽丝')
+    // A glossary written for one language must not leak into another.
+    assert.deepEqual(await readProjectGlossary(gameDir, 'English'), {})
+    // Saving the glossary must keep the translation memory in the same file.
+    const doc = JSON.parse(await readFile(cachePath, 'utf8'))
+    assert.equal(doc.entries.abc, '甲')
+    assert.equal(doc.glossary.terms.エルフ, '精灵')
+    const merged = await mergeGlossary({}, join(gameDir, 'ManualTransFile.json'), '简体中文', ['アリス=>艾莉丝'])
     assert.equal(merged.find(entry => entry.source === 'アリス').target, '艾莉丝')
     assert.equal(merged.find(entry => entry.source === 'エルフ').target, '精灵')
     assert.equal(merged.length, 2)
