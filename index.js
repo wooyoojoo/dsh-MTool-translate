@@ -465,6 +465,26 @@ export function looksLikeCode(text) {
 }
 
 /**
+ * Whether a string is an identifier rather than prose.
+ *
+ * MTool also exports parameter names, asset ids and numeric constants
+ * (`count:120`, `jingle-jazz`, `MessageSkip:`, `-1000`). They are not shader
+ * source, so the code rules above miss them, but neither are they text: they
+ * carry no spaces, no CJK, and at least one structural separator. A real
+ * one-word label such as `Start` has no separator and stays translatable.
+ *
+ * @param text - one original string.
+ * @returns Whether the string is an identifier-like token.
+ */
+export function looksLikeIdentifier(text) {
+  if (typeof text !== 'string' || text === '') return false
+  if (CJK_TEXT.test(text)) return false
+  if (/\s/u.test(text)) return false
+  if (!/[A-Za-z0-9]/u.test(text)) return false
+  return /[:_.%*#@$/+-]/u.test(text)
+}
+
+/**
  * Decide whether a string should reach the model at all.
  *
  * Ported from `general_text_filter.py`, plus a length guard and a whole-line
@@ -484,7 +504,6 @@ export function skipReason(text, exclusion = []) {
   if (exclusion.some(entry => (entry.regex === true
     ? (entry.pattern?.test(text) ?? false)
     : text.trim() === entry.source.trim()))) return 'excluded'
-  if (looksLikeCode(text)) return 'code'
   if (text.length > MAX_LINE_CHARS) return 'too-long'
   if (/^\d+$/u.test(text)) return 'numeric'
   if (text.trim() === '') return 'empty'
@@ -493,10 +512,10 @@ export function skipReason(text, exclusion = []) {
   const suffix = text.trim().endsWith('.') ? '' : text.trim().slice(text.trim().lastIndexOf('.'))
   if (suffix !== '' && EXCLUDE_SUFFIX.has(suffix.toLowerCase())) return 'file-suffix'
   if (EXCLUDE_PREFIX.some(prefix => text.startsWith(prefix))) return 'code-prefix'
-  const excluded = exclusion.some(entry => (entry.regex === true
-    ? (entry.pattern?.test(text) ?? false)
-    : text.trim() === entry.source.trim()))
-  if (excluded) return 'excluded'
+  // Content rules run last, so a specific reason (a path, a number) wins over
+  // the broader code/identifier classification they also satisfy.
+  if (looksLikeCode(text)) return 'code'
+  if (looksLikeIdentifier(text)) return 'identifier'
   return undefined
 }
 

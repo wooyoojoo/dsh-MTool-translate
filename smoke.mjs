@@ -48,6 +48,7 @@ const {
   isChineseLanguage,
   lineDefect,
   looksLikeCode,
+  looksLikeIdentifier,
   looksLikeOriginal,
   maskCodes,
   normalizeLineEndings,
@@ -216,6 +217,14 @@ check('a regex exclusion marker matches like build_re_pattern', () => {
 })
 check('MTool metadata is never translated', () => {
   assert.equal(skipReason('MTool_Meta_DO_NOT_REMOVE {"v":1}'), 'mtool-meta')
+})
+check('identifier-shaped tokens are skipped too', () => {
+  for (const text of ['count:120', 'jingle-jazz', 'MessageSkip:', '-1000', 'popup_back%d', 'line*1', 'shader/compileProgram', 'text/xml', '999+']) {
+    assert.equal(looksLikeIdentifier(text), true, text)
+  }
+  for (const text of ['Start', 'OK', 'Options', 'はじめから', 'Note: hello world']) {
+    assert.equal(looksLikeIdentifier(text), false, text)
+  }
 })
 check('shader and script fragments are recognised as code', () => {
   for (const text of [
