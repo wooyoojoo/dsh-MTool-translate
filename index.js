@@ -1050,6 +1050,254 @@ export async function resolveGlossary(value) {
   }
 }
 
+/** Directory under the state dir that holds one glossary per game. */
+export const GLOSSARY_DIR = 'glossaries'
+
+/**
+ * Stable key for one game directory.
+ *
+ * Keyed by the directory, not the file, so a re-export of the same game keeps
+ * its glossary even though the file's contents changed.
+ *
+ * @param projectDir - the directory holding `ManualTransFile.json`.
+ * @returns A short hex key.
+ */
+export function projectKey(projectDir) {
+  return createHash('sha1').update(resolve(projectDir), 'utf8').digest('hex').slice(0, 16)
+}
+
+/**
+ * Read the glossary stored for one game.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param projectDir - the game directory.
+ * @returns The glossary file path, the project path, and its terms.
+ */
+export async function readProjectGlossary(stateDir, projectDir) {
+  const path = join(stateDir, GLOSSARY_DIR, `${projectKey(projectDir)}.json`)
+  let text
+  try {
+    text = await readFile(path, 'utf8')
+  } catch {
+    return { path, project: resolve(projectDir), terms: {} }
+  }
+  try {
+    const parsed = JSON.parse(text)
+    const terms = {}
+    for (const [source, target] of Object.entries(isPlainObject(parsed?.terms) ? parsed.terms : {})) {
+      if (isFilledString(source) && isFilledString(target)) terms[source] = target
+    }
+    return { path, project: resolve(projectDir), terms }
+  } catch {
+    return { path, project: resolve(projectDir), terms: {} }
+  }
+}
+
+/**
+ * Persist the glossary for one game.
+ *
+ * @param stateDir - the plugin's state directory.
+ * @param projectDir - the game directory.
+ * @param terms - the complete `{ source: target }` map.
+ * @returns The written path.
+ */
+export async function writeProjectGlossary(stateDir, projectDir, terms) {
+  const path = join(stateDir, GLOSSARY_DIR, `${projectKey(projectDir)}.json`)
+  const body = {
+    version: 1,
+    project: resolve(projectDir),
+    updatedAt: new Date().toISOString(),
+    terms,
+  }
+  await writeAtomic(path, `${JSON.stringify(body, null, 2)}\n`)
+  return path
+}
+
+/** A run of katakana, which in game text is usually a name or a loanword. */
+const KATAKANA_RUN = /[ァ-ヶー]{2,}/gu
+
+/** A name attached to an honorific, the strongest name signal in dialogue. */
+const HONORIFIC_NAME = /([一-龠ァ-ヶー]{1,8})(?:様|さん|ちゃん|君|くん|殿|先生)/gu
+
+/**
+ * Pick the strings worth putting in a glossary.
+ *
+ * No model is involved: frequent katakana runs and names carrying an honorific
+ * are cheap, deterministic evidence. Noise is expected and reviewable, which is
+ * why building a glossary is a separate step from translating.
+ *
+ * @param entries - the parsed `ManualTransFile.json`.
+ * @param limit - how many candidates to keep.
+ * @returns Candidates ordered by how often they occur.
+ */
+export function extractTermCandidates(entries, limit = 40) {
+  const counts = new Map()
+  const bump = (term) => {
+    const value = term.trim()
+    if (value.length < 2 || value.length > 16) return
+    counts.set(value, (counts.get(value) ?? 0) + 1)
+  }
+  for (const key of Object.keys(entries)) {
+    if (typeof key !== 'string') continue
+    if (looksLikeCode(key) || looksLikeIdentifier(key)) continue
+    for (const match of key.matchAll(KATAKANA_RUN)) bump(match[0])
+    for (const match of key.matchAll(HONORIFIC_NAME)) bump(match[1])
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([term, count]) => ({ term, count }))
+}
+
+/**
+ * Ask the model for one translation per term.
+ *
+ * Reuses the numbered `<textarea>` protocol, so the reply needs no second
+ * parser and one bad line cannot shift the whole mapping.
+ *
+ * @param llm - the `llm` service.
+ * @param route - the model route.
+ * @param terms - candidates from `extractTermCandidates`.
+ * @param target - target language.
+ * @param signal - cancellation.
+ * @returns `{ source, target }` pairs, dropping anything unusable.
+ */
+export async function translateTerms(llm, route, terms, target, signal) {
+  if (terms.length === 0) return []
+  const system = [
+    `你在做游戏本地化，目标语言是${target}。`,
+    '下面这些是同一部游戏文本里反复出现的专有名词（人名、地名、道具名等）。',
+    '逐行给出译名，只输出译文；人名用常见音译，地名和道具名意译，保持简短。',
+    '### 以textarea标签输出译文',
+    '<textarea>',
+    `1.${target}文本`,
+    '</textarea>',
+  ].join('\n')
+  const user = terms.map((entry, index) => `${index + 1}.${entry.term}`).join('\n')
+  const result = await complete(llm, route, system, user, signal)
+  const translations = extractTranslation(result.text)
+  return terms
+    .map((entry, index) => ({ source: entry.term, target: String(translations[index] ?? '').trim() }))
+    .filter(entry => entry.target !== '' && entry.target !== entry.source)
+}
+
+/**
+ * The `mtool_translate_glossary` tool definition.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved config.
+ * @param runtime - the plugin runtime carrying the state directory.
+ * @returns The definition passed to `ctx.tools.register`.
+ */
+export function defineGlossaryTool(ctx, config, runtime) {
+  const render = (_args, value) => {
+    const lines = [value.glossary.length === 0
+      ? 'No glossary is stored for this game yet.'
+      : `Glossary for ${value.project} (${value.glossary.length} term(s)):`]
+    for (const entry of value.glossary) lines.push(`- ${entry.source} => ${entry.target}`)
+    if (value.built === true) lines.push('', 'Built from this export. Edit it with action "set" or "remove".')
+    return [{ type: 'text', text: lines.join('\n') }]
+  }
+  return {
+    name: 'mtool_translate_glossary',
+    description: 'List, build, edit, or clear the name glossary stored for one game. '
+      + 'translate_mtool_file loads it automatically, so building it once keeps character, place, and item names consistent across every batch and later re-runs. '
+      + 'Build extracts frequent katakana names and honorific-attached names from the export and asks the model for one translation each; show the result to the user before translating, and fix entries with action "set" when they disagree.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'Path to the ManualTransFile.json of that game.' },
+        action: { type: 'string', enum: ['list', 'build', 'set', 'remove'], description: 'What to do. Defaults to list.' },
+        terms: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'For set: "原文=>译文" entries. For remove: source strings.',
+        },
+      },
+      required: ['path'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          project: { type: 'string' },
+          built: { type: 'boolean' },
+          glossary: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { source: { type: 'string' }, target: { type: 'string' } },
+              required: ['source', 'target'],
+            },
+          },
+        },
+        required: ['project', 'glossary'],
+      },
+      render,
+    },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      if (!isPlainObject(args) || !isFilledString(args.path)) {
+        throw new Error('mtoolTranslate: `path` must name the game\'s ManualTransFile.json')
+      }
+      const inputPath = resolve(args.path)
+      const projectDir = dirname(inputPath)
+      const stored = await readProjectGlossary(runtime.stateDir, projectDir)
+      const terms = { ...stored.terms }
+      const action = isFilledString(args.action) ? args.action : 'list'
+
+      if (action === 'build') {
+        const { entries } = await readManualTrans(inputPath)
+        const candidates = extractTermCandidates(entries)
+        if (candidates.length === 0) {
+          return { project: stored.project, built: false, glossary: [] }
+        }
+        const llm = ctx.get?.('llm')
+        if (llm === undefined || typeof llm.stream !== 'function') {
+          throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
+        }
+        const route = resolveRoute(ctx, config, {})
+        const raw = await translateTerms(llm, route, candidates, config.target, exec.signal)
+        for (const entry of raw) terms[entry.source] = entry.target
+        await writeProjectGlossary(runtime.stateDir, projectDir, terms)
+        return { project: stored.project, built: true, glossary: glossaryList(terms) }
+      }
+
+      if (action === 'set') {
+        for (const entry of normalizeGlossary(args.terms)) terms[entry.source] = entry.target
+        await writeProjectGlossary(runtime.stateDir, projectDir, terms)
+        return { project: stored.project, built: false, glossary: glossaryList(terms) }
+      }
+
+      if (action === 'remove') {
+        for (const source of Array.isArray(args.terms) ? args.terms : []) {
+          if (typeof source === 'string') delete terms[source.trim()]
+        }
+        await writeProjectGlossary(runtime.stateDir, projectDir, terms)
+        return { project: stored.project, built: false, glossary: glossaryList(terms) }
+      }
+
+      return { project: stored.project, built: false, glossary: glossaryList(terms) }
+    },
+  }
+}
+
+/**
+ * Project a glossary map onto sorted pairs.
+ *
+ * @param terms - `{ source: target }`.
+ * @returns Pairs, ordered by source.
+ */
+export function glossaryList(terms) {
+  return Object.entries(terms)
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .map(([source, target]) => ({ source, target }))
+}
+
 /**
  * Whether one glossary term applies to a line.
  *
@@ -1869,6 +2117,27 @@ export function resolveOutput(inputPath, config, requested) {
 }
 
 /**
+ * Combine the game's stored glossary with anything named for this call.
+ *
+ * An explicit `glossary` argument or YAML entry wins over the stored one, so a
+ * one-off correction never needs the store edited first.
+ *
+ * @param runtime - the plugin runtime; undefined in unit tests.
+ * @param inputPath - the export being translated.
+ * @param explicit - a glossary passed to this call, or undefined.
+ * @returns The glossary to apply, as `{ source, target }` pairs.
+ */
+export async function mergeGlossary(runtime, inputPath, explicit) {
+  const merged = new Map()
+  if (runtime !== undefined) {
+    const stored = await readProjectGlossary(runtime.stateDir, dirname(inputPath))
+    for (const [source, target] of Object.entries(stored.terms)) merged.set(source, target)
+  }
+  for (const entry of await resolveGlossary(explicit)) merged.set(entry.source, entry.target)
+  return [...merged].map(([source, target]) => ({ source, target }))
+}
+
+/**
  * Project one result onto the content the model and the UI see.
  *
  * @param value - the tool result.
@@ -1879,6 +2148,7 @@ export function renderContent(value) {
     `Translated ${value.totals.translated} of ${value.totals.pending} pending line(s) into ${value.target} with ${value.model}`
       + ` (${value.totals.cached} from cache, ${value.totals.failed} failed, ${(value.durationMs / 1000).toFixed(1)}s).`,
     value.source === undefined ? undefined : `Detected source language: ${value.source}`,
+    value.glossarySize > 0 ? `Glossary: ${value.glossarySize} term(s) applied` : undefined,
     `Output: ${value.output}`,
     value.note,
   ].filter(line => line !== undefined)
@@ -1943,6 +2213,7 @@ export function defineTranslateTool(ctx, config, runtime) {
           target: { type: 'string' },
           source: { type: 'string' },
           note: { type: 'string' },
+          glossarySize: { type: 'integer' },
           model: { type: 'string' },
           dryRun: { type: 'boolean' },
           done: { type: 'boolean' },
@@ -2029,7 +2300,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
   }
   const route = dryRun ? { provider: 'dry-run', model: 'dry-run' } : resolveRoute(ctx, config, args)
-  const glossary = await resolveGlossary(args.glossary ?? config.glossary)
+  const glossary = await mergeGlossary(runtime, inputPath, args.glossary ?? config.glossary)
   const exclusion = compileExclusion(config.exclusion)
 
   const { path: outputPath, cachePath } = resolveOutput(inputPath, config, args.outputPath)
@@ -2058,6 +2329,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       output: outputPath,
       target,
       source,
+      glossarySize: glossary.length,
       model: route.model,
       dryRun: true,
       done: pending.length === 0,
@@ -2076,6 +2348,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       output: outputPath,
       target,
       source,
+      glossarySize: glossary.length,
       model: route.model,
       dryRun: false,
       done: true,
@@ -2162,6 +2435,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     output: outputPath,
     target,
     source,
+    glossarySize: glossary.length,
     model: route.model,
     dryRun: false,
     done: totals.remaining === 0,
@@ -2430,7 +2704,9 @@ export function defineConfigTool(ctx, runtime) {
  */
 export function apply(ctx, config) {
   const runtime = { stateDir: resolveStateDir() }
-  ctx.tools.register(defineTranslateTool(ctx, resolveConfig(config), runtime))
+  const resolved = resolveConfig(config)
+  ctx.tools.register(defineTranslateTool(ctx, resolved, runtime))
   ctx.tools.register(defineConfigTool(ctx, runtime))
+  ctx.tools.register(defineGlossaryTool(ctx, resolved, runtime))
   mountRoutes(ctx, runtime)
 }

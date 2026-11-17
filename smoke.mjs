@@ -43,6 +43,7 @@ const {
   digitalSequence,
   digitalSequenceRestore,
   executeTranslate,
+  extractTermCandidates,
   extractTranslation,
   isPending,
   isChineseLanguage,
@@ -51,10 +52,12 @@ const {
   looksLikeIdentifier,
   looksLikeOriginal,
   maskCodes,
+  mergeGlossary,
   normalizeLineEndings,
   parseJsonReply,
   prepareBatch,
   prepareText,
+  readProjectGlossary,
   readReply,
   repairSymbols,
   resolveConfig,
@@ -63,6 +66,7 @@ const {
   skipReason,
   stripCodeAffixes,
   unmaskCodes,
+  writeProjectGlossary,
 } = await import('./index.js')
 
 let failures = 0
@@ -405,6 +409,36 @@ await writeFile(inputPath, JSON.stringify({
 }, null, 2))
 
 try {
+  await checkAsync('term candidates are names, not code or one-off words', async () => {
+    const candidates = extractTermCandidates({
+      'アリスは笑った。': 'アリスは笑った。',
+      'アリスとエルナが来た。': 'アリスとエルナが来た。',
+      'エリナさんが言った。': 'エリナさんが言った。',
+      おはよう: 'おはよう',
+      'count:120': 'count:120',
+      'uniform float x;': 'uniform float x;',
+    })
+    const names = candidates.map(candidate => candidate.term)
+    assert.equal(names.includes('アリス'), true)
+    assert.equal(names.includes('エリナ'), true)
+    assert.equal(names.includes('count:120'), false)
+    assert.equal(names.includes('uniform float x;'), false)
+    assert.equal(names.includes('おはよう'), false)
+  })
+
+  await checkAsync('the per-game glossary round-trips, and an explicit term wins', async () => {
+    const stateDir = join(dir, 'state')
+    const gameDir = join(dir, 'game')
+    await mkdir(gameDir, { recursive: true })
+    await writeProjectGlossary(stateDir, gameDir, { アリス: '爱丽丝', エルフ: '精灵' })
+    const stored = await readProjectGlossary(stateDir, gameDir)
+    assert.equal(stored.terms.アリス, '爱丽丝')
+    const merged = await mergeGlossary({ stateDir }, join(gameDir, 'ManualTransFile.json'), ['アリス=>艾莉丝'])
+    assert.equal(merged.find(entry => entry.source === 'アリス').target, '艾莉丝')
+    assert.equal(merged.find(entry => entry.source === 'エルフ').target, '精灵')
+    assert.equal(merged.length, 2)
+  })
+
   await checkAsync('a run translates pending lines, keeps finished ones, and writes valid JSON', async () => {
     const llm = stubLlm(keep)
     const result = await executeTranslate(stubCtx(llm), config, { path: inputPath }, undefined)
