@@ -50,6 +50,7 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
 | `Backend/resources/regex/regex.json` | 50 多条 RPG Maker / Wolf / KRKR 控制码正则，顺序照抄 |
 | `Backend/domain/text/text_processor.py` | `[Pn]` 占位符（整批共享计数）、逆序还原、非日文字符前后缀剥离 |
 | `Backend/domain/text/filters/general_text_filter.py` | 跳过规则：纯数字、空行、纯标点、文件后缀、代码前缀 |
+| `Backend/domain/text/filters/code_text_filter.py` | 代码/着色器片段不送翻；规则按 GLSL/JS/CSS 标记和标点密度重写（MTool 会把插件内嵌 shader 也导出来，必须挡） |
 | `Backend/domain/responses/response_extractor.py` | `<textarea>` + `N.译文` 回包解析、丢弃序号前的废话 |
 | `Backend/domain/responses/advanced_checks.py` | 占位符是否齐全、换行符数是否一致、返回原文 / 翻译残留判定 |
 | `Backend/domain/prompts/glossary_helper.py` | 术语按有无空格/间隔点拆词匹配，不区分大小写 |
