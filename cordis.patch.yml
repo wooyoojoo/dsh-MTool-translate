@@ -1,0 +1,12 @@
+# Layer contributed by the dsh-mtool-translate bundle.
+#
+# No model route is baked in: the tool resolves the profile's default model on
+# every call, so one installed package follows whatever route the user configured
+# in Settings. Pin `provider` and `model` here to translate with a specific
+# model instead — a patch replaces the whole config object, so restate every key.
+- insert:
+    - id: mtool-translate
+      name: dsh-mtool-translate
+      config:
+        target: 简体中文
+        reasoningEffort: low

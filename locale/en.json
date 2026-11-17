@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MTool text translation",
+    "description": "Translates an MTool game-text export with this profile's model and writes a JSON file MTool can load back. Usage: in MTool open 翻译 → 导出游戏原文 so a ManualTransFile.json appears next to the game, drop that file into the chat, and the agent calls translate_mtool_file; then pick the produced *.translated.json in MTool under 翻译 → 加载翻译文件. RPG Maker control codes such as \\C[3], \\V[1] and \\n are masked, checked, and restored, and lines already translated are skipped, so a second run only pays for new text. Every call sends the pending game text to the model route configured in Settings and spends that route's tokens; large files are sent in batches of about 30 lines. A cache file named .mtool-translate-cache.json is written beside the export and can be deleted at any time. Turning the plugin off removes the tool and leaves the exported file untouched."
+  }
+}

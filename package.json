@@ -1,0 +1,31 @@
+{
+  "name": "dsh-mtool-translate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Translate MTool game-text exports (ManualTransFile.json) with the profile's own model and write a file MTool can load back.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node smoke.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "samples",
+    "README.md",
+    "smoke.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

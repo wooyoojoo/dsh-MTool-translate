@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MTool 文本翻译",
+    "description": "用当前配置的模型翻译 MTool 导出的游戏文本，并生成 MTool 可以直接加载回来的 JSON。用法：在 MTool 里「翻译 → 导出游戏原文」，游戏目录会生成 ManualTransFile.json，把它拖进对话，助手会调用 translate_mtool_file；翻译完成后在 MTool 里「翻译 → 加载翻译文件」选择生成的 *.translated.json。\\C[3]、\\V[1]、\\n 这类 RPG Maker 控制码会先被遮蔽、校验再还原；已翻译的行会跳过，所以第二次运行只为新增文本付费。每次调用都会把待翻译文本发给「设置」里的模型线路，并消耗该线路的 token；大文件按每批约 30 行发送。导出文件旁边会生成 .mtool-translate-cache.json 缓存，可随时删除。关闭插件只会移除该工具，不会改动导出文件。"
+  }
+}
