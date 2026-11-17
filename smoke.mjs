@@ -10,8 +10,9 @@
  * exercised without spending a model call.
  */
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { registerHooks } from 'node:module'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -382,6 +383,21 @@ try {
     assert.equal(result.done, true)
   })
 
+  await checkAsync('cacheEnabled: false neither reads nor writes the cache file', async () => {
+    const sub = join(dir, 'nocache')
+    await mkdir(sub, { recursive: true })
+    const file = join(sub, 'ManualTransFile.json')
+    await writeFile(file, JSON.stringify({ かな: 'かな' }))
+    const nocache = resolveConfig({ provider: 'stub', model: 'stub-model', cacheEnabled: false })
+    const llm = stubLlm(keep)
+    const first = await executeTranslate(stubCtx(llm), nocache, { path: file }, undefined)
+    assert.equal(first.totals.translated, 1)
+    assert.equal(existsSync(join(sub, '.mtool-translate-cache.json')), false)
+    const second = await executeTranslate(stubCtx(llm), nocache, { path: file }, undefined)
+    assert.equal(second.totals.cached, 0)
+    assert.equal(llm.calls.length, 2)
+  })
+
   await checkAsync('a dropped placeholder is retried instead of written back', async () => {
     const file = join(dir, 'retry.json')
     // The code sits inside the line, so it becomes a placeholder the reply can drop.
@@ -398,8 +414,7 @@ try {
     assert.equal(output['勇者\\C[3]だ'], '译勇者\\C[3]だ')
   })
 
-  await checkAsync('dryRun reports the plan without calling the model', async () => {
-    const file = join(dir, 'dry.json')
+  await checkAsync('dryRun reports the plan without calling the model', async () => {    const file = join(dir, 'dry.json')
     await writeFile(file, JSON.stringify({ ああ: 'ああ' }))
     const result = await executeTranslate(stubCtx(undefined), config, { path: file, dryRun: true }, undefined)
     assert.equal(result.dryRun, true)

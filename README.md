@@ -94,12 +94,13 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
     target: 简体中文
     sourceLanguage: 日语
     model: deepseek-flash      # 不填则跟随「设置」里的默认模型
-    reasoningEffort: off       # off | low | high | max（翻译建议 off）
-    batchLines: 20
-    batchChars: 1200
-    concurrency: 3
+    reasoningEffort: low       # off | low | high | max
+    batchLines: 40
+    batchChars: 1600
+    concurrency: 8
     maxRetries: 2
     symbolRepair: true
+    cacheEnabled: true         # 关掉后不读也不写 .mtool-translate-cache.json
     checkReturnedOriginal: false
     checkResidualOriginal: false
     exclusion: []              # 禁翻表，整行匹配就跳过
@@ -107,6 +108,10 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
     postReplace: {}            # 译后替换
     glossary: {"エルフ": "精灵"}  # 也可以用工具参数传
 ```
+
+### 增量缓存
+
+`.mtool-translate-cache.json` 是逐行对照表（`sha1(目标语言+原文) → 译文`），写在导出文件旁边。它只影响「下次再翻同一份/同一目录」，不影响 MTool 加载；关掉 `cacheEnabled` 后不再读写。删掉也安全，只是下次会重新付费翻译。注意它保存了译文原文，分享游戏目录时会一起带出去。
 
 ## 限制
 

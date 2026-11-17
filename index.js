@@ -71,6 +71,7 @@ export const SETTING_FIELDS = {
   maxTokens: { kind: 'integer', min: 256, max: 32768, default: 8192, description: '回复 token 上限' },
   previousLines: { kind: 'integer', min: 0, max: 20, default: 0, description: '随请求带上的上文字数' },
   symbolRepair: { kind: 'boolean', default: true, description: '修复引号/省略号/问号' },
+  cacheEnabled: { kind: 'boolean', default: true, description: '保留增量缓存（.mtool-translate-cache.json），关掉后不再读写' },
   checkReturnedOriginal: { kind: 'boolean', default: false, description: '检查模型是否原样返回原文' },
   checkResidualOriginal: { kind: 'boolean', default: false, description: '检查译文是否残留原文' },
   outputDir: { kind: 'string', description: '输出目录（留空写在输入文件旁）' },
@@ -383,6 +384,7 @@ export function resolveConfig(config) {
     // AiNiee exposes these as switches; placeholder/newline/empty checks are
     // always on, these three are opt-in and off by default.
     symbolRepair: boolean('symbolRepair', true),
+    cacheEnabled: boolean('cacheEnabled', true),
     checkReturnedOriginal: boolean('checkReturnedOriginal', false),
     checkResidualOriginal: boolean('checkResidualOriginal', false),
   }
@@ -1922,7 +1924,7 @@ export async function executeTranslate(ctx, config, args, signal) {
   const exclusion = compileExclusion(config.exclusion)
 
   const { path: outputPath, cachePath } = resolveOutput(inputPath, config, args.outputPath)
-  const cache = await readCache(cachePath, target)
+  const cache = config.cacheEnabled ? await readCache(cachePath, target) : new Map()
   const { items, finished, cached, skipped } = collectWork(entries, { force, limit, cache, target, exclusion })
   const pending = items.filter(item => item.skip === undefined && item.cached === undefined)
   const totals = {
@@ -1989,6 +1991,7 @@ export async function executeTranslate(ctx, config, args, signal) {
     checkpointChain = checkpointChain.then(async () => {
       for (const [key, value] of translations) entries[key] = value
       await writeAtomic(outputPath, JSON.stringify(entries, null, 4))
+      if (config.cacheEnabled === false) return
       const merged = new Map(cache)
       for (const [key, value] of translations) merged.set(cacheKey(key, target), value)
       await writeCache(cachePath, target, Object.fromEntries(merged))
