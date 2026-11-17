@@ -86,29 +86,30 @@ pnpm install --prod     # 配置表单依赖 @deepseek-ai/schemastery
 
 **在界面里改**：设置 → 插件 → `dsh-mtool-translate`（点进 bundle 页面，表单在描述和插件行之间）→ 改完点「保存」，**下次翻译立即生效，不用重启**。
 
-保存的值落在 `~/.dsh/mtool-translate/settings.json`，优先级高于下面 YAML 里的同名项；点「恢复默认」会清掉文件里的覆盖值。也可以在对话里说「并发改 6」，助手会用 `mtool_translate_config` 写同一个文件。
+页面上只有两项：
 
-参数（YAML 里同样可用，作为未在页面上覆盖时的默认）：
+- **推理强度**：`off` / `low` / `high` / `max`（默认 `low`）
+- **增量缓存**：保留 / 关闭（默认保留）
+
+其余都是代码里的固定值，故意不给旋钮：
+
+| 项 | 固定行为 |
+| --- | --- |
+| 源语言 | 从文件内容自动判断（假名→日语、谚文→韩语、西里尔→俄语、汉字→中文、否则英语） |
+| 目标语言 | 由你在对话里点名（「日译中」「翻成繁中」「译成英文」），不点名默认简中 |
+| 模型 | 跟随 DSH「设置 → 模型」里的默认线路，当前是 `deepseek-official / deepseek-flash` |
+| 批次 | 每请求 40 行 / 1600 字，8 并发，重试 2 次，回复上限 8192 token |
+| 输出位置 | 永远写在输入文件旁边 |
+
+保存的值落在 `~/.dsh/mtool-translate/settings.json`，改完下次翻译立即生效；点「恢复默认」清掉覆盖。也可以在对话里说「推理开 high」，助手用 `mtool_translate_config` 写同一个文件。
+
+YAML 里只有这两项可配：
 
 ```yaml
 - id: mtool-translate
   config:
-    target: 简体中文
-    sourceLanguage: 日语
-    model: deepseek-flash      # 不填则跟随「设置」里的默认模型
-    reasoningEffort: low       # off | low | high | max
-    batchLines: 40
-    batchChars: 1600
-    concurrency: 8
-    maxRetries: 2
-    symbolRepair: true
-    cacheEnabled: true         # 关掉后不读也不写 .mtool-translate-cache.json
-    checkReturnedOriginal: false
-    checkResidualOriginal: false
-    exclusion: []              # 禁翻表，整行匹配就跳过
-    preReplace: {}             # 译前替换 {"原文": "替换"}
-    postReplace: {}            # 译后替换
-    glossary: {"エルフ": "精灵"}  # 也可以用工具参数传
+    reasoningEffort: low
+    cacheEnabled: true
 ```
 
 ### 增量缓存

@@ -49,33 +49,17 @@ export const name = 'mtoolTranslate'
 export const inject = ['tools']
 
 /**
- * Settings a user may change, in the order the config tool reports them.
+ * Settings a user may change: the two knobs that are worth a decision.
  *
- * One source of truth: `Config` builds the Loader schema (the form the Plugins
- * page renders) from these entries, and `mtool_translate_config` validates
- * against them. `@deepseek-ai/schemastery` is a declared dependency pinned to
- * the version the running Harness ships, so the schema is the same class the
- * Loader already validates with.
+ * Everything else is fixed in code — source language is detected from the
+ * file, the target language is named per call by the user ("日译中"), the model
+ * route follows the profile default, and batch shape, retries, and output
+ * location are engineering constants. `Config` and the config tool both build
+ * from this table, so the Plugins page and the agent see the same surface.
  */
 export const SETTING_FIELDS = {
-  target: { kind: 'string', default: '简体中文', description: '目标语言' },
-  sourceLanguage: { kind: 'string', default: '日语', description: '源语言' },
-  provider: { kind: 'string', description: '模型线路（留空跟随默认）' },
-  model: { kind: 'string', description: '模型 ID（留空跟随默认）' },
-  reasoningEffort: { kind: 'enum', values: ['off', 'low', 'high', 'max'], default: 'low', description: '推理强度：off 最快，low 术语更稳' },
-  promptPreset: { kind: 'enum', values: ['common', 'cot'], default: 'common', description: '提示词预设' },
-  targetPlatform: { kind: 'enum', values: ['default', 'sakura'], default: 'default', description: '占位符风格' },
-  batchLines: { kind: 'integer', min: 1, max: 200, default: 40, description: '每请求行数' },
-  batchChars: { kind: 'integer', min: 200, max: 8000, default: 1600, description: '每请求字符数' },
-  concurrency: { kind: 'integer', min: 1, max: 16, default: 8, description: '并发请求数' },
-  maxRetries: { kind: 'integer', min: 0, max: 5, default: 2, description: '每批重试次数' },
-  maxTokens: { kind: 'integer', min: 256, max: 32768, default: 8192, description: '回复 token 上限' },
-  previousLines: { kind: 'integer', min: 0, max: 20, default: 0, description: '随请求带上的上文字数' },
-  symbolRepair: { kind: 'boolean', default: true, description: '修复引号/省略号/问号' },
+  reasoningEffort: { kind: 'enum', values: ['off', 'low', 'high', 'max'], default: 'low', description: '推理强度：off 最快，low 术语更稳，high/max 更慢' },
   cacheEnabled: { kind: 'boolean', default: true, description: '保留增量缓存（.mtool-translate-cache.json），关掉后不再读写' },
-  checkReturnedOriginal: { kind: 'boolean', default: false, description: '检查模型是否原样返回原文' },
-  checkResidualOriginal: { kind: 'boolean', default: false, description: '检查译文是否残留原文' },
-  outputDir: { kind: 'string', description: '输出目录（留空写在输入文件旁）' },
 }
 
 /**
@@ -1727,6 +1711,45 @@ export function isJapaneseSource(language) {
 }
 
 /**
+ * Guess a file's source language from a sample of its pending lines.
+ *
+ * Kana wins over Han so a Japanese file is never mistaken for Chinese just
+ * because a sample happened to hold only kanji. The answer feeds the prompt's
+ * `{source_language}` slot and the Japanese affix rule.
+ *
+ * @param texts - the source strings to sample.
+ * @returns A language name; `英语` when nothing matches.
+ */
+export function detectSourceLanguage(texts) {
+  const sample = texts.slice(0, 500)
+  let kana = 0
+  let hangul = 0
+  let cyrillic = 0
+  let han = 0
+  for (const text of sample) {
+    if (/[\u3041-\u3096\u30a0-\u30ff]/u.test(text)) kana += 1
+    else if (/[\uac00-\ud7af]/u.test(text)) hangul += 1
+    else if (/[\u0400-\u04ff]/u.test(text)) cyrillic += 1
+    else if (/[\u4e00-\u9fff]/u.test(text)) han += 1
+  }
+  if (kana > 0) return '日语'
+  if (hangul > 0) return '韩语'
+  if (cyrillic > 0) return '俄语'
+  if (han > 0) return '中文'
+  return '英语'
+}
+
+/**
+ * Whether a language name means Chinese.
+ *
+ * @param language - a language name or code.
+ * @returns Whether it names Chinese.
+ */
+export function isChineseLanguage(language) {
+  return typeof language === 'string' && /中文|汉语|漢語|chinese|^zh/iu.test(language.trim())
+}
+
+/**
  * Pick the model route for this call.
  *
  * @param ctx - plugin context.
@@ -1779,8 +1802,10 @@ export function renderContent(value) {
   const lines = [
     `Translated ${value.totals.translated} of ${value.totals.pending} pending line(s) into ${value.target} with ${value.model}`
       + ` (${value.totals.cached} from cache, ${value.totals.failed} failed, ${(value.durationMs / 1000).toFixed(1)}s).`,
+    value.source === undefined ? undefined : `Detected source language: ${value.source}`,
     `Output: ${value.output}`,
-  ]
+    value.note,
+  ].filter(line => line !== undefined)
   if (value.totals.remaining > 0) {
     lines.push(`${value.totals.remaining} line(s) still pending — call this tool again with the same path to continue.`)
   }
@@ -1802,8 +1827,9 @@ export function renderContent(value) {
 export function defineTranslateTool(ctx, config, runtime) {
   return {
     name: 'translate_mtool_file',
-    description: 'Translate an MTool game-text export (ManualTransFile.json) into Chinese with this profile\'s model, '
+    description: 'Translate an MTool game-text export (ManualTransFile.json) with this profile\'s model, '
       + 'and write a JSON file that MTool can load back (翻译 → 加载翻译文件). '
+      + 'The source language is detected from the file; the target defaults to 简体中文 and should be set explicitly when the user names a pair such as 日译中. '
       + 'RPG Maker control codes are masked as [P1] placeholders and validated, replies are checked line by line, '
       + 'finished lines are cached, and progress is checkpointed, so a long run can be resumed by calling again with the same path. '
       + 'Add a glossary for character and item names when the user cares about consistent naming.',
@@ -1812,7 +1838,7 @@ export function defineTranslateTool(ctx, config, runtime) {
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Path to the ManualTransFile.json exported by MTool (翻译 → 导出游戏原文).' },
-        target: { type: 'string', description: `Target language. Defaults to ${DEFAULT_TARGET}.` },
+        target: { type: 'string', description: `Target language named by the user, such as 简体中文, 繁體中文, or English. Defaults to ${DEFAULT_TARGET} when the user names none.` },
         reasoningEffort: {
           type: 'string',
           enum: ['off', 'low', 'high', 'max'],
@@ -1839,6 +1865,8 @@ export function defineTranslateTool(ctx, config, runtime) {
           input: { type: 'string' },
           output: { type: 'string' },
           target: { type: 'string' },
+          source: { type: 'string' },
+          note: { type: 'string' },
           model: { type: 'string' },
           dryRun: { type: 'boolean' },
           done: { type: 'boolean' },
@@ -1932,6 +1960,9 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
   const cache = config.cacheEnabled ? await readCache(cachePath, target) : new Map()
   const { items, finished, cached, skipped } = collectWork(entries, { force, limit, cache, target, exclusion })
   const pending = items.filter(item => item.skip === undefined && item.cached === undefined)
+  // The file decides its own source language; the caller only names the target.
+  const source = detectSourceLanguage(pending.map(item => item.key))
+  const sameLanguage = isChineseLanguage(source) && isChineseLanguage(target)
   const totals = {
     entries: Object.keys(entries).length,
     pending: pending.length,
@@ -1948,11 +1979,31 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       input: inputPath,
       output: outputPath,
       target,
+      source,
       model: route.model,
       dryRun: true,
       done: pending.length === 0,
       totals,
       batches: { total: buildBatches(pending, config).length, run: 0 },
+      usage: { inputTokens: 0, outputTokens: 0 },
+      durationMs: Date.now() - startedAt,
+      failures: [],
+    }
+  }
+
+  if (sameLanguage) {
+    // Translating Chinese into Chinese would spend tokens to echo the file.
+    return {
+      input: inputPath,
+      output: outputPath,
+      target,
+      source,
+      model: route.model,
+      dryRun: false,
+      done: true,
+      note: `${source}文本译成${target}没有意义，已跳过：文件看起来已经是目标语言。`,
+      totals: { ...totals, pending: 0, remaining: 0, skipped: totals.skipped + pending.length },
+      batches: { total: 0, run: 0 },
       usage: { inputTokens: 0, outputTokens: 0 },
       durationMs: Date.now() - startedAt,
       failures: [],
@@ -1965,6 +2016,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
   const compiled = {
     ...config,
     target,
+    sourceLanguage: source,
     exclusion,
     preReplaceRules: compileReplacements(config.preReplace),
     postReplaceRules: compileReplacements(config.postReplace),
@@ -2031,6 +2083,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     input: inputPath,
     output: outputPath,
     target,
+    source,
     model: route.model,
     dryRun: false,
     done: totals.remaining === 0,

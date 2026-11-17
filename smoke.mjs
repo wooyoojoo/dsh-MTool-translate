@@ -39,11 +39,13 @@ const {
   compileExclusion,
   compileReplacements,
   countNewlines,
+  detectSourceLanguage,
   digitalSequence,
   digitalSequenceRestore,
   executeTranslate,
   extractTranslation,
   isPending,
+  isChineseLanguage,
   lineDefect,
   looksLikeOriginal,
   maskCodes,
@@ -328,6 +330,19 @@ check('sakura placeholders use arrow runs', () => {
   assert.equal(prepared[0].restore('甲↓乙↓↓丙'), '甲\\C[1]乙\\C[2]丙')
 })
 
+console.log('source detection')
+check('kana wins over kanji, and other scripts are recognised', () => {
+  assert.equal(detectSourceLanguage(['こんにちは', '漢字だけ']), '日语')
+  assert.equal(detectSourceLanguage(['这是中文', '这也是']), '中文')
+  assert.equal(detectSourceLanguage(['hello world']), '英语')
+  assert.equal(detectSourceLanguage(['안녕하세요']), '韩语')
+})
+check('chinese targets are recognised by name or code', () => {
+  assert.equal(isChineseLanguage('简体中文'), true)
+  assert.equal(isChineseLanguage('Traditional Chinese'), true)
+  assert.equal(isChineseLanguage('English'), false)
+})
+
 console.log('config')
 check('defaults are filled and bad values rejected', () => {
   const resolved = resolveConfig({})
@@ -396,6 +411,19 @@ try {
     const second = await executeTranslate(stubCtx(llm), nocache, { path: file }, undefined)
     assert.equal(second.totals.cached, 0)
     assert.equal(llm.calls.length, 2)
+  })
+
+  await checkAsync('a Chinese file targeting Chinese is skipped without model calls', async () => {
+    const sub = join(dir, 'zh')
+    await mkdir(sub, { recursive: true })
+    const file = join(sub, 'ManualTransFile.json')
+    await writeFile(file, JSON.stringify({ 这是中文: '这是中文', 这也是中文: '这也是中文' }))
+    const llm = stubLlm(keep)
+    const result = await executeTranslate(stubCtx(llm), config, { path: file }, undefined)
+    assert.equal(result.done, true)
+    assert.equal(result.totals.translated, 0)
+    assert.match(result.note, /已经是目标语言/)
+    assert.equal(llm.calls.length, 0)
   })
 
   await checkAsync('a dropped placeholder is retried instead of written back', async () => {
