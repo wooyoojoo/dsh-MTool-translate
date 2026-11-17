@@ -15,11 +15,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  adjustParagraphQuotes,
+  applyReplacements,
   buildBatches,
   buildSourceText,
+  buildSystemPrompt,
   cacheKey,
   CODE_PATTERNS,
   collectWork,
+  compileExclusion,
+  compileReplacements,
   countNewlines,
   digitalSequence,
   digitalSequenceRestore,
@@ -182,8 +187,15 @@ check('the obvious non-translatable shapes are skipped', () => {
   assert.equal(skipReason('こんにちは'), undefined)
 })
 check('the exclusion list skips an exact line', () => {
-  assert.equal(skipReason('艾莉丝', ['艾莉丝']), 'excluded')
-  assert.equal(skipReason('艾莉丝大人', ['艾莉丝']), undefined)
+  const exclusion = compileExclusion(['艾莉丝'])
+  assert.equal(skipReason('艾莉丝', exclusion), 'excluded')
+  assert.equal(skipReason('艾莉丝大人', exclusion), undefined)
+})
+check('a regex exclusion marker matches like build_re_pattern', () => {
+  const exclusion = compileExclusion([{ markers: '\\[EV\\d+\\]', info: 'id', regex: true }, '固定'])
+  assert.equal(skipReason('[EV12]', exclusion), 'excluded')
+  assert.equal(skipReason('固定', exclusion), 'excluded')
+  assert.equal(skipReason('普通', exclusion), undefined)
 })
 check('MTool metadata is never translated', () => {
   assert.equal(skipReason('MTool_Meta_DO_NOT_REMOVE {"v":1}'), 'mtool-meta')
@@ -244,6 +256,34 @@ check('ellipsis and question mark are repaired', () => {
   assert.equal(repairSymbols('そうか…', '这样啊...'), '这样啊…')
   assert.equal(repairSymbols('元気？', '还好?'), '还好？')
 })
+check('per-line straight quotes are dropped when the source has none', () => {
+  assert.equal(adjustParagraphQuotes('一行目\n二行目', '"第一行"\n"第二行"'), '第一行\n第二行')
+})
+
+console.log('ported tables (regex.py + text_processor.py)')
+check('a regex replacement row is compiled and applied', () => {
+  const rules = compileReplacements([{ src: '\\d+', dst: '#', regex: true }, { src: 'A', dst: 'B' }])
+  assert.equal(applyReplacements('A12', rules), 'B#')
+})
+check('a plain replacement map still works', () => {
+  assert.equal(applyReplacements('AB', compileReplacements({ A: 'C', B: 'D' })), 'CD')
+})
+check('the system prompt carries every ported section', () => {
+  const prompt = buildSystemPrompt({
+    target: '简体中文',
+    sourceLanguage: '日语',
+    glossary: [{ source: '勇者', target: '勇者大人' }],
+    exclusion: compileExclusion(['艾莉丝']),
+    batchText: '勇者と艾莉丝',
+    characters: [{ original_name: '勇者', translated_name: '勇者大人', gender: '男' }],
+    worldBuilding: '剑与魔法的世界',
+    writingStyle: '口语化',
+    translationExample: [{ src: 'こんにちは', dst: '你好' }],
+  })
+  for (const part of ['###术语表', '###禁翻表', '###角色介绍', '###背景设定', '###翻译风格', '###翻译示例', '<textarea>']) {
+    assert.equal(prompt.includes(part), true, `missing ${part}`)
+  }
+})
 
 console.log('batch preparation')
 check('prepare and restore round-trips a line', () => {
@@ -262,6 +302,16 @@ check('placeholders do not leak from one line to the next in a batch', () => {
   assert.equal(prepared[1].placeholders.length, 0)
   assert.equal(prepared[1].masked, 'はい')
   assert.equal(prepared[1].restore('是'), '是')
+})
+check('sakura placeholders use arrow runs', () => {
+  const { items: prepared } = prepareBatch([{ key: 'k', text: 'あ\\C[1]い\\C[2]う' }], {
+    targetPlatform: 'sakura',
+    symbolRepair: false,
+    target: '简体中文',
+    sourceLanguage: '日语',
+  })
+  assert.equal(prepared[0].masked, 'あ↓い↓↓う')
+  assert.equal(prepared[0].restore('甲↓乙↓↓丙'), '甲\\C[1]乙\\C[2]丙')
 })
 
 console.log('config')

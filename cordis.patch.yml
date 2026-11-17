@@ -10,3 +10,5 @@
       config:
         target: 简体中文
         reasoningEffort: off
+        batchLines: 40
+        concurrency: 8

@@ -49,13 +49,13 @@ export const inject = ['tools']
 export const DEFAULT_TARGET = '简体中文'
 
 /** Lines one model request may carry. */
-export const DEFAULT_BATCH_LINES = 20
+export const DEFAULT_BATCH_LINES = 40
 
 /** Source characters one model request may carry. */
-export const DEFAULT_BATCH_CHARS = 1200
+export const DEFAULT_BATCH_CHARS = 1600
 
 /** Model requests in flight at once. */
-export const DEFAULT_CONCURRENCY = 3
+export const DEFAULT_CONCURRENCY = 8
 
 /** Attempts per batch beyond the first. */
 export const DEFAULT_MAX_RETRIES = 2
@@ -176,6 +176,43 @@ const EXCLUDE_PREFIX = ['MapData/', 'SE/', 'BGS', '0=', 'BGM/', 'FIcon/', '<inpu
  */
 const JAPANESE_CLASS = '\\u3040-\\u309F\\u30A0-\\u30FF\\u30FB-\\u30FE\\uFF65-\\uFF9F\\u4E00-\\u9FFF\\u3400-\\u4DBF\\u3001-\\u303F\\uFF01-\\uFF5E'
 
+/**
+ * The `common` system prompt, verbatim from
+ * `resources/prompts/Translate/common_system_zh.txt`.
+ */
+const COMMON_SYSTEM = [
+  '你是一名专业的翻译家，你的任务是把{source_language}文本翻译成{target_language}，逐行翻译，不要合并，原始保留文本中序号、标记符、占位符、换行符、转义符、代码调用过程等特殊内容，保持原来的格式。',
+  '',
+  '### 翻译原则',
+  '忠实准确地进行翻译。原作是伟大艺术作品，允许使用直白或粗俗的描述，不应随意删减或篡改，不应回避或淡化，以保持作品的原貌。',
+  '',
+  '### 以textarea标签输出译文',
+  '<textarea>',
+  '1.{target_language}文本',
+  '</textarea>',
+].join('\n')
+
+/** The `cot` system prompt, verbatim from `cot_system_zh.txt`. */
+const COT_SYSTEM = [
+  '你是一名专业的翻译家，请你按照以下流程进行翻译：',
+  '第一步：初步直译',
+  '    将{source_language}文本逐行直译成{target_language}文本，原始保留文本中序号、标记符、占位符、换行符、转义符、代码调用过程等特殊内容，保持原来的格式。',
+  '',
+  '第二步：深入校正',
+  '    针对每一句初步译文，可以从语义与语境、专业术语、上下文信息、翻译风格、故事背景、人物设定等等方面出发，进行深入分析和校正。',
+  '',
+  '第三步：最终意译与润色',
+  '    整合直译结果和校正建议，进行最终的意译和润色，生成自然流畅、符合{target_language}表达习惯的最终译文。',
+  '',
+  '### 翻译原则',
+  '忠实准确地进行翻译。原作是伟大艺术作品，允许使用直白或粗俗的描述，不应随意删减或篡改，不应回避或淡化，以保持作品的原貌。',
+  '',
+  '### 以textarea标签输出译文',
+  '<textarea>',
+  '1.{target_language}文本',
+  '</textarea>',
+].join('\n')
+
 /** `^(\s*)(.*?)(\s*)$` — the whitespace-only affix rule (RE_WHITESPACE_AFFIX). */
 const RE_WHITESPACE_AFFIX = /^(\s*)([\s\S]*?)(\s*)$/u
 
@@ -219,12 +256,6 @@ export function resolveConfig(config) {
     if (typeof value !== 'boolean') throw new Error(`mtoolTranslate: config.${field} must be a boolean`)
     return value
   }
-  const stringMap = (field) => {
-    const value = raw[field]
-    if (value === undefined) return {}
-    if (!isPlainObject(value)) throw new Error(`mtoolTranslate: config.${field} must be an object of strings`)
-    return value
-  }
 
   for (const field of ['target', 'provider', 'model', 'reasoningEffort', 'outputDir', 'sourceLanguage']) {
     if (raw[field] !== undefined && !isFilledString(raw[field])) {
@@ -254,9 +285,16 @@ export function resolveConfig(config) {
     previousLines: integer('previousLines', 0, 0),
     outputDir: raw.outputDir,
     glossary: raw.glossary,
+    // Rows may be `{src, dst, regex}` objects or a plain `{from: to}` map.
     exclusion: raw.exclusion ?? [],
-    preReplace: stringMap('preReplace'),
-    postReplace: stringMap('postReplace'),
+    preReplace: raw.preReplace,
+    postReplace: raw.postReplace,
+    characters: Array.isArray(raw.characters) ? raw.characters : [],
+    worldBuilding: typeof raw.worldBuilding === 'string' ? raw.worldBuilding : '',
+    writingStyle: typeof raw.writingStyle === 'string' ? raw.writingStyle : '',
+    translationExample: Array.isArray(raw.translationExample) ? raw.translationExample : [],
+    targetPlatform: raw.targetPlatform === 'sakura' ? 'sakura' : 'default',
+    promptPreset: raw.promptPreset === 'cot' ? 'cot' : 'common',
     // AiNiee exposes these as switches; placeholder/newline/empty checks are
     // always on, these three are opt-in and off by default.
     symbolRepair: boolean('symbolRepair', true),
@@ -332,7 +370,10 @@ export function skipReason(text, exclusion = []) {
   const suffix = text.trim().endsWith('.') ? '' : text.trim().slice(text.trim().lastIndexOf('.'))
   if (suffix !== '' && EXCLUDE_SUFFIX.has(suffix.toLowerCase())) return 'file-suffix'
   if (EXCLUDE_PREFIX.some(prefix => text.startsWith(prefix))) return 'code-prefix'
-  if (exclusion.some(term => term.trim() !== '' && text.trim() === term.trim())) return 'excluded'
+  const excluded = exclusion.some(entry => (entry.regex === true
+    ? (entry.pattern?.test(text) ?? false)
+    : text.trim() === entry.source.trim()))
+  if (excluded) return 'excluded'
   return undefined
 }
 
@@ -379,19 +420,113 @@ export function collectWork(entries, options = {}) {
 }
 
 /**
- * Apply the user's pre-translation replacement table.
+ * Build one regex, returning `undefined` when the pattern is invalid.
  *
- * Ported from `text_processor.replace_before_translation`; the table is a plain
- * `{ from: to }` object rather than AiNiee's regex-capable rows.
+ * @param source - the pattern text.
+ * @param flags - regex flags.
+ * @returns The regex, or undefined.
+ */
+export function safeRegex(source, flags = '') {
+  try {
+    return new RegExp(source, flags)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Normalize a replacement table into compiled rules.
  *
- * @param text - one original string.
- * @param rules - `{ from: to }`.
+ * Ported from `text_processor._compile_translation_rules`: a row may be a
+ * plain `from -> to` pair or a regex row (`regex: true`); an invalid pattern is
+ * dropped instead of aborting the run.
+ *
+ * @param rules - `{from: to}` map or `[{src, dst, regex}]` rows.
+ * @returns Compiled rules.
+ */
+export function compileReplacements(rules) {
+  if (rules === undefined || rules === null) return []
+  const rows = []
+  const add = (src, dst, regex) => {
+    if (!isFilledString(src) || typeof dst !== 'string') return
+    rows.push({ src: src.trim(), dst, regex: regex === true })
+  }
+  if (Array.isArray(rules)) {
+    for (const row of rules) {
+      if (isPlainObject(row)) add(row.src ?? row.from, row.dst ?? row.to ?? '', row.regex)
+    }
+  } else if (isPlainObject(rules)) {
+    for (const [src, dst] of Object.entries(rules)) add(src, dst, false)
+  }
+  return rows.map(row => ({ ...row, pattern: row.regex ? safeRegex(row.src) : undefined }))
+}
+
+/**
+ * Normalize the exclusion list.
+ *
+ * Ported from `regex.RegexSwitchHelper.normalize_exclusion_rows` +
+ * `build_re_pattern`: each row is an exact marker or, with `regex: true`, a
+ * pattern.
+ *
+ * @param rows - strings or `{markers, info, regex}` rows.
+ * @returns Compiled entries.
+ */
+export function compileExclusion(rows) {
+  const list = []
+  for (const row of rows ?? []) {
+    if (typeof row === 'string') {
+      if (isFilledString(row)) list.push({ source: row.trim(), info: '', regex: false })
+      continue
+    }
+    if (!isPlainObject(row)) continue
+    const source = String(row.markers ?? row.source ?? row.text ?? '').trim()
+    if (source === '') continue
+    list.push({ source, info: String(row.info ?? row.note ?? ''), regex: row.regex === true })
+  }
+  return list.map(entry => ({ ...entry, pattern: entry.regex ? safeRegex(entry.source) : undefined }))
+}
+
+/**
+ * Find the exclusion markers present in one batch.
+ *
+ * Ported from `prompt_builder.build_ntl_prompt`: only markers that actually
+ * occur in the batch are sent, so the model never sees an unrelated list.
+ *
+ * @param text - the batch's source text.
+ * @param exclusion - compiled entries.
+ * @returns `[marker, info]` pairs.
+ */
+export function collectExclusionMatches(text, exclusion) {
+  const hits = new Map()
+  for (const entry of exclusion ?? []) {
+    if (entry.regex === true) {
+      if (entry.pattern === undefined) continue
+      for (const match of text.matchAll(new RegExp(entry.pattern.source, 'gu'))) {
+        if (match[0] !== '') hits.set(match[0], entry.info)
+      }
+    } else if (text.includes(entry.source)) {
+      hits.set(entry.source, entry.info)
+    }
+  }
+  return [...hits.entries()]
+}
+
+/**
+ * Apply the compiled replacement rules.
+ *
+ * @param text - one string.
+ * @param rules - compiled rules from `compileReplacements`.
  * @returns The replaced text.
  */
 export function applyReplacements(text, rules) {
   let out = text
-  for (const [from, to] of Object.entries(rules ?? {})) {
-    if (from !== '' && typeof to === 'string') out = out.split(from).join(to)
+  for (const rule of rules ?? []) {
+    if (rule.regex === true) {
+      if (rule.pattern === undefined) continue
+      out = out.replace(new RegExp(rule.pattern.source, 'gu'), rule.dst)
+    } else if (rule.src !== '') {
+      out = out.split(rule.src).join(rule.dst)
+    }
   }
   return out
 }
@@ -665,7 +800,8 @@ export function maskCodes(text, state) {
   for (const { pattern } of CODE_PATTERNS) {
     masked = masked.replace(pattern, (match) => {
       state.counter += 1
-      const placeholder = `[P${state.counter}]`
+      // Sakura's local models take runs of ↓ instead of bracketed tokens.
+      const placeholder = state.sakura === true ? '↓'.repeat(state.counter) : `[P${state.counter}]`
       state.entries.push({ placeholder, original: match })
       return placeholder
     })
@@ -816,24 +952,64 @@ export function attachGlossary(items, glossary) {
  * @returns The system message.
  */
 export function buildSystemPrompt(options) {
-  const { target, sourceLanguage, glossary = [], exclusion = [] } = options
-  const lines = [
-    `你是一名专业的翻译家，你的任务是把${sourceLanguage}文本翻译成${target}，逐行翻译，不要合并，原始保留文本中序号、标记符、占位符、换行符、转义符、代码调用过程等特殊内容，保持原来的格式。`,
-    '',
-    '### 翻译原则',
-    '忠实准确地进行翻译。原作是伟大艺术作品，允许使用直白或粗俗的描述，不应随意删减或篡改，不应回避或淡化，以保持作品的原貌。',
-  ]
-  // Appended the way `generate_prompt` appends the project tables.
+  const {
+    target,
+    sourceLanguage,
+    glossary = [],
+    exclusion = [],
+    batchText = '',
+    characters = [],
+    worldBuilding = '',
+    writingStyle = '',
+    translationExample = [],
+    preset = 'common',
+  } = options
+  let out = (preset === 'cot' ? COT_SYSTEM : COMMON_SYSTEM)
+    .replaceAll('{source_language}', sourceLanguage)
+    .replaceAll('{target_language}', target)
+
+  // Appended in the order `generate_prompt` appends the project tables.
   if (glossary.length > 0) {
-    lines.push('', '###术语表', '原文|译文|备注')
-    for (const entry of glossary) lines.push(`${entry.source}|${entry.target}| `)
+    out += '\n###术语表\n原文|译文|备注'
+    for (const entry of glossary) out += `\n${entry.source}|${entry.target}| `
   }
-  if (exclusion.length > 0) {
-    lines.push('', '###禁翻表，以下原文保持不变', '原文|备注')
-    for (const term of exclusion) lines.push(`${term}|`)
+  const nonTranslate = collectExclusionMatches(batchText, exclusion)
+  if (nonTranslate.length > 0) {
+    out += '\n###禁翻表，以下原文保持不变\n原文|备注'
+    for (const [marker, info] of nonTranslate) out += `\n${marker}|${info}`
   }
-  lines.push('', '### 以textarea标签输出译文', '<textarea>', `1.${target}文本`, '</textarea>')
-  return lines.join('\n')
+  const present = characters.filter((character) => {
+    const name = character.original_name ?? character.name ?? ''
+    return isFilledString(name) && batchText.includes(name)
+  })
+  if (present.length > 0) {
+    out += '\n###角色介绍'
+    for (const character of present) {
+      out += `\n【${character.original_name ?? character.name}】`
+      const fields = [
+        ['译名', character.translated_name],
+        ['性别', character.gender],
+        ['年龄', character.age],
+        ['性格', character.personality],
+        ['说话方式', character.speech_style],
+        ['补充信息', character.additional_info],
+      ]
+      for (const [label, value] of fields) {
+        if (isFilledString(value)) out += `\n- ${label}：${value}`
+      }
+      out += '\n'
+    }
+  }
+  if (isFilledString(worldBuilding)) out += `\n###背景设定\n${worldBuilding}\n`
+  if (isFilledString(writingStyle)) out += `\n###翻译风格\n${writingStyle}\n`
+  if (translationExample.length > 0) {
+    out += '\n###翻译示例\n'
+    translationExample.forEach((pair, index) => {
+      if (index > 0) out += '\n'
+      out += `  -原文${index + 1}：${pair.src ?? pair.original ?? ''}\n  -译文${index + 1}：${pair.dst ?? pair.translated ?? ''}`
+    })
+  }
+  return out
 }
 
 /**
@@ -1140,7 +1316,40 @@ export function repairSymbols(original, translated) {
     .split('--').join('—')
     .split('?').join('？')
 
+  // Stage 4 of `repair_text_symbols`: a model that quotes every translated
+  // line in a multi-line block, when the source only quotes the block.
+  target = adjustParagraphQuotes(sourceCore, target)
+
   return leading + target + trailing
+}
+
+/**
+ * Drop the per-line straight quotes a model adds to a multi-line block.
+ *
+ * Ported from `text_symbol_repair.check_and_adjust_quotes`: a line keeps its
+ * quote only when the matching source line starts or ends with one.
+ *
+ * @param original - the source text.
+ * @param translated - the translated text.
+ * @returns The translated text with stray line quotes removed.
+ */
+export function adjustParagraphQuotes(original, translated) {
+  const originalLines = original.split('\n')
+  const translatedLines = translated.split('\n')
+  if (originalLines.length !== translatedLines.length) return translated
+  return translatedLines.map((line, index) => {
+    const sourceLine = originalLines[index] ?? ''
+    let out = line
+    if (out.length >= 2 && out.startsWith('"')) {
+      const first = sourceLine[0] ?? ''
+      if (!['"', '“', '「', "'"].includes(first)) out = out.slice(1)
+    }
+    if (out.length >= 2 && out.endsWith('"')) {
+      const last = sourceLine[sourceLine.length - 1] ?? ''
+      if (!['"', '”', '」', "'"].includes(last)) out = out.slice(0, -1)
+    }
+    return out
+  }).join('\n')
 }
 
 /**
@@ -1253,8 +1462,8 @@ export async function complete(llm, route, system, user, signal) {
  * @returns Translated lines by source text, plus the failures.
  */
 export async function translateBatch(preparedBatch, context) {
-  const { llm, route, system, maxRetries, signal, onUsage, options } = context
-  const { items, previous } = preparedBatch
+  const { llm, route, maxRetries, signal, onUsage, options } = context
+  const { items, previous, system } = preparedBatch
   const done = new Map()
   const failures = []
   const defects = new Map()
@@ -1370,10 +1579,10 @@ export async function runBatches(batches, context) {
  * @returns The prepared batch.
  */
 export function prepareBatch(batch, options = {}) {
-  const state = { counter: 0, entries: [] }
+  const state = { counter: 0, entries: [], sakura: options.targetPlatform === 'sakura' }
   const jaMode = isJapaneseSource(options.sourceLanguage)
   const items = batch.map((item) => {
-    const pre = applyReplacements(item.text, options.preReplace)
+    const pre = applyReplacements(item.text, options.preReplaceRules ?? [])
     const prepared = prepareText(pre, { jaMode })
     const stripped = stripCodeAffixes(prepared.payload)
     const payload = digitalSequence(stripped.text)
@@ -1392,14 +1601,30 @@ export function prepareBatch(batch, options = {}) {
         // Mirror `text_processor.restore_all`, in the same order.
         let out = unmaskCodes(translated, placeholders)
         out = stripped.prefixes.join('') + out + stripped.suffixes.join('')
-        if (options.postReplace !== undefined) out = applyReplacements(out, options.postReplace)
+        if (options.postReplaceRules !== undefined) out = applyReplacements(out, options.postReplaceRules)
         out = digitalSequenceRestore(out)
         if (options.symbolRepair !== false) out = repairSymbols(sourceCore, out)
         return restoreText(out, prepared)
       },
     }
   })
-  return { previous: options.previous ?? [], items }
+  const terms = new Map()
+  for (const item of batch) {
+    for (const entry of item.glossary ?? []) terms.set(entry.source, entry.target)
+  }
+  const system = buildSystemPrompt({
+    target: options.target,
+    sourceLanguage: options.sourceLanguage,
+    glossary: [...terms].map(([source, target]) => ({ source, target })),
+    exclusion: options.exclusion ?? [],
+    batchText: batch.map(item => item.text).join('\n'),
+    characters: options.characters ?? [],
+    worldBuilding: options.worldBuilding ?? '',
+    writingStyle: options.writingStyle ?? '',
+    translationExample: options.translationExample ?? [],
+    preset: options.promptPreset ?? 'common',
+  })
+  return { previous: options.previous ?? [], items, system }
 }
 
 /**
@@ -1465,7 +1690,7 @@ export function resolveOutput(inputPath, config, requested) {
 export function renderContent(value) {
   const lines = [
     `Translated ${value.totals.translated} of ${value.totals.pending} pending line(s) into ${value.target} with ${value.model}`
-      + ` (${value.totals.cached} from cache, ${value.totals.failed} failed).`,
+      + ` (${value.totals.cached} from cache, ${value.totals.failed} failed, ${(value.durationMs / 1000).toFixed(1)}s).`,
     `Output: ${value.output}`,
   ]
   if (value.totals.remaining > 0) {
@@ -1604,7 +1829,7 @@ export async function executeTranslate(ctx, config, args, signal) {
   }
   const route = dryRun ? { provider: 'dry-run', model: 'dry-run' } : resolveRoute(ctx, config, args)
   const glossary = await resolveGlossary(args.glossary ?? config.glossary)
-  const exclusion = config.exclusion ?? []
+  const exclusion = compileExclusion(config.exclusion)
 
   const { path: outputPath, cachePath } = resolveOutput(inputPath, config, args.outputPath)
   const cache = await readCache(cachePath, target)
@@ -1640,17 +1865,18 @@ export async function executeTranslate(ctx, config, args, signal) {
   attachGlossary(pending, glossary)
   const batches = buildBatches(pending, config)
   const toRun = maxBatches > 0 ? batches.slice(0, maxBatches) : batches
-  const system = buildSystemPrompt({
+  const compiled = {
+    ...config,
     target,
-    sourceLanguage: config.sourceLanguage,
-    glossary,
     exclusion,
-  })
+    preReplaceRules: compileReplacements(config.preReplace),
+    postReplaceRules: compileReplacements(config.postReplace),
+  }
   const prepared = toRun.map((batch, index) => {
     const previous = config.previousLines > 0 && index > 0
       ? batches[index - 1].slice(-config.previousLines).map(item => item.text)
       : []
-    return prepareBatch(batch, { ...config, previous })
+    return prepareBatch(batch, { ...compiled, previous })
   })
 
   for (const item of items) {
@@ -1684,8 +1910,7 @@ export async function executeTranslate(ctx, config, args, signal) {
     const result = await runBatches(prepared, {
       llm,
       route,
-      system,
-      options: config,
+      options: compiled,
       maxRetries: config.maxRetries,
       concurrency: config.concurrency,
       signal,
