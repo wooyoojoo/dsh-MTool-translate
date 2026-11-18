@@ -49,23 +49,26 @@ export const name = 'mtoolTranslate'
 export const inject = ['tools']
 
 /**
- * Lines one model request may carry.
+ * Hard ceiling on lines one model request may carry.
  *
- * Measured on a real MV export (deepseek-flash, 8 streams): 40 lines cost
- * ~0.74 s/line, 100 lines ~1.12 s/line, 200 lines ~1.05 s/line. Per-line cost
- * rises with batch width, so the win comes from streams in flight, not from
- * one long request; 60 is a small step above the old 40 without leaving the
- * fast part of that curve.
+ * A ceiling, not a target: `replyLineBudget` derives what the reply can actually
+ * hold, and this is what the user allows on top of that. A big file spread over
+ * eight workers never reaches it; a wide file on one worker does.
+ *
+ * The old 60 came from a latency curve measured at `low` on 40/100/200-line
+ * batches, but the binding constraint turned out to be the 2400-character cap,
+ * not this one — 200 lines of 24 characters split into two requests with
+ * `batchLines` still at 200.
  */
-export const DEFAULT_BATCH_LINES = 60
+export const DEFAULT_BATCH_LINES = 200
 
 /**
  * Source characters one model request may carry.
  *
- * Only binds on dialogue-heavy files (60 lines x 40 chars). Together with the
- * line cap it keeps one reply well under `DEFAULT_MAX_TOKENS`.
+ * Raised alongside the line ceiling so a dialogue-heavy batch is bounded by its
+ * reply budget rather than by a constant inherited from 60-line batches.
  */
-export const DEFAULT_BATCH_CHARS = 2400
+export const DEFAULT_BATCH_CHARS = 8000
 
 /**
  * Model requests in flight at once.
@@ -76,6 +79,46 @@ export const DEFAULT_BATCH_CHARS = 2400
  * width.
  */
 export const DEFAULT_CONCURRENCY = 8
+
+/**
+ * Output-token ceiling for one batch reply.
+ *
+ * The route accepted 20000, so the old 8192 was a self-imposed rope rather than
+ * a provider limit. 16384 leaves room for a full wide batch at `low` — the
+ * effort that actually spends tokens on thinking — without claiming an
+ * unverified maximum.
+ */
+export const DEFAULT_MAX_TOKENS = 16384
+
+/**
+ * Output tokens per translated line, by reasoning effort.
+ *
+ * Priors for `replyLineBudget`, from a live 200-line run: `off` spent 12.6
+ * output tokens per line and `low` 48.5, because this route folds thinking into
+ * `outputTokens` instead of reporting `reasoningTokens`. Planning a batch wider
+ * than this budget allows is how a reply gets truncated.
+ */
+export const REPLY_TOKENS_PER_LINE = { off: 16, low: 48, high: 64, max: 80 }
+
+/**
+ * Share of the reply ceiling a batch may plan for.
+ *
+ * The remainder is slack: one line can be far longer than the average, and a
+ * reply that hits the ceiling loses its tail instead of stopping cleanly.
+ */
+export const REPLY_BUDGET_SHARE = 0.75
+
+/**
+ * Lines that fit the reply budget at one reasoning effort.
+ *
+ * @param config - resolved config carrying `maxTokens` and `reasoningEffort`.
+ * @returns The line ceiling the reply can hold, never below the bisection width.
+ */
+export function replyLineBudget(config) {
+  const perLine = REPLY_TOKENS_PER_LINE[config.reasoningEffort] ?? REPLY_TOKENS_PER_LINE.low
+  const budget = (config.maxTokens ?? DEFAULT_MAX_TOKENS) * REPLY_BUDGET_SHARE
+  return Math.max(8, Math.floor(budget / perLine))
+}
 
 /**
  * Settings a user may change: the knobs that are worth a decision.
@@ -89,7 +132,9 @@ export const DEFAULT_CONCURRENCY = 8
 export const SETTING_FIELDS = {
   reasoningEffort: { kind: 'enum', values: ['off', 'low', 'high', 'max'], default: 'low', description: '推理强度：off 最快，low 术语更稳，high/max 更慢' },
   batchLines: { kind: 'number', min: 8, max: 400, default: DEFAULT_BATCH_LINES, description: '每请求行数：越大请求越少，但单请求延迟更高、错行概率更大' },
+  batchChars: { kind: 'number', min: 200, max: 20000, default: DEFAULT_BATCH_CHARS, description: '每请求原文字数：它比行数更常成为真正的切批约束，调大行数不生效时看这里' },
   concurrency: { kind: 'number', min: 1, max: 32, default: DEFAULT_CONCURRENCY, description: '同时在飞的请求数：吞吐的真正杠杆，撞限流就调低' },
+  maxTokens: { kind: 'number', min: 256, max: 65536, default: DEFAULT_MAX_TOKENS, description: '单请求回复上限：调大用来探线路的真实输出上限，超过服务端限制会整批报错' },
 }
 
 /**
@@ -155,8 +200,74 @@ export const DEFAULT_MAX_RETRIES = 2
 /** Cooperative per-call budget; a big file needs room for many batches. */
 export const DEFAULT_TIMEOUT_MS = 900_000
 
-/** Output-token ceiling for one batch reply. */
-export const DEFAULT_MAX_TOKENS = 8192
+/**
+ * Usage counters a route may report for one request.
+ *
+ * DSH's `TokenUsage` carries more than the two totals this plugin used to read:
+ * a caching route reports `cacheReadTokens` / `cacheWriteTokens`, and a
+ * reasoning route reports `reasoningTokens`. Reading them costs nothing, and
+ * without them the two questions that decide the strategy — "did the prefix
+ * cache hit" and "how much of the bill is thinking" — are unanswerable.
+ */
+export const USAGE_FIELDS = ['inputTokens', 'outputTokens', 'totalTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens']
+
+/** A zeroed usage accumulator carrying every `USAGE_FIELDS` key. */
+export function emptyUsage() {
+  return Object.fromEntries(USAGE_FIELDS.map(field => [field, 0]))
+}
+
+/**
+ * Fold one stream's usage chunk into an accumulator.
+ *
+ * Every reported field is summed as-is. The route reports `inputTokens` as the
+ * **uncached** part of the prompt and `cacheReadTokens` as the cached part —
+ * measured on this route: a repeated request reported `inputTokens` 311 and
+ * `cacheReadTokens` 3,454 against a 3,765-token prompt, and `totalTokens` 12,868
+ * for 3,765 + 9,103. `finalizeUsage` is what puts the two halves back together.
+ *
+ * @param into - accumulator from `emptyUsage`; mutated.
+ * @param chunk - the `usage` payload of one stream, if it sent one.
+ * @returns The same accumulator.
+ */
+export function addUsage(into, chunk) {
+  if (chunk === undefined || chunk === null || typeof chunk !== 'object') return into
+  for (const field of USAGE_FIELDS) {
+    const value = chunk[field]
+    if (typeof value === 'number' && Number.isFinite(value)) into[field] += value
+  }
+  return into
+}
+
+/**
+ * Fill the totals a route may not report, so no reader has to reconstruct them.
+ *
+ * `promptTokens` = uncached input + cache read; `totalTokens` falls back to
+ * prompt + output when the route omits it.
+ *
+ * @param usage - an accumulated `emptyUsage` value.
+ * @returns A copy carrying `promptTokens` and a filled `totalTokens`.
+ */
+export function finalizeUsage(usage) {
+  const prompt = (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0)
+  const output = usage.outputTokens ?? 0
+  return {
+    ...usage,
+    promptTokens: prompt,
+    totalTokens: (usage.totalTokens ?? 0) > 0 ? usage.totalTokens : prompt + output,
+  }
+}
+
+/**
+ * Per-call delivery counters, reported beside the tokens.
+ *
+ * A request count well above the batch count is the signature of retries and
+ * bisections doing the spending, which is invisible when only tokens are
+ * summed: a bisected batch looks like one line of token accounting and eight
+ * requests of latency.
+ */
+export function emptyStats() {
+  return { requests: 0, retries: 0, failedRequests: 0, bisections: 0, singleLineRequests: 0, truncatedReplies: 0 }
+}
 
 /**
  * Reasoning effort for the routed model. Translation is formatting, not
@@ -1028,16 +1139,42 @@ export function buildBatches(items, options = {}) {
  * A fixed batch width collapses a small file into a single request, which
  * serialises what used to be eight parallel ones. Widening is capped so that
  * every worker gets at least one batch, and narrowing stops at the bisection
- * width so a misaligned reply still has room to be split.
+ * width so a misaligned reply still has room to be split. The reply budget caps
+ * it a third time: a batch the tail of the reply cannot hold is a batch that
+ * comes back truncated.
  *
  * @param items - pending work items.
- * @param config - resolved config carrying `batchLines`, `batchChars`, `concurrency`.
+ * @param config - resolved config carrying `batchLines`, `batchChars`,
+ *   `concurrency`, `maxTokens`, `reasoningEffort`.
  * @returns One array per request, each in file order.
  */
 export function planBatches(items, config) {
   const perWorker = Math.ceil(items.length / config.concurrency)
-  const batchLines = Math.min(config.batchLines, Math.max(BISECT_MIN_LINES, perWorker))
+  const fits = replyLineBudget(config)
+  const batchLines = Math.min(config.batchLines, Math.max(BISECT_MIN_LINES, perWorker), fits)
   return buildBatches(items, { ...config, batchLines })
+}
+
+/**
+ * Lines that fit a reply at this config, for reporting what the plan allows.
+ *
+ * Mirrors `planBatches`' three cuts — the configured ceiling, the share of the
+ * file each worker gets, and the reply budget — so the reported number is the
+ * width the run actually used, not just the setting.
+ *
+ * @param config - resolved config.
+ * @param items - how many lines this run has to place.
+ * @returns `{ budget, lines, chars }`: the reply budget, the per-request line
+ *   ceiling it implies, and the character cap that still applies.
+ */
+export function planWidth(config, items = 0) {
+  const budget = replyLineBudget(config)
+  const perWorker = Math.ceil(items / config.concurrency)
+  return {
+    budget,
+    lines: Math.min(config.batchLines, Math.max(BISECT_MIN_LINES, perWorker), budget),
+    chars: config.batchChars,
+  }
 }
 
 /**
@@ -1149,6 +1286,217 @@ export async function writeProjectGlossary(projectDir, target, terms) {
   }
   await writeAtomic(path, JSON.stringify(next))
   return path
+}
+
+/**
+ * Read the style brief stored for one game and target language.
+ *
+ * @param projectDir - the directory holding the export.
+ * @param target - target language.
+ * @returns The brief, or an empty string when none is stored for that language.
+ */
+export async function readProjectStyle(projectDir, target) {
+  let doc
+  try {
+    doc = JSON.parse(await readFile(join(projectDir, CACHE_FILE), 'utf8'))
+  } catch {
+    return ''
+  }
+  const block = doc?.style
+  if (!isPlainObject(block) || block.target !== target) return ''
+  return isFilledString(block.brief) ? block.brief : ''
+}
+
+/**
+ * Store (or clear) a style brief, keeping the translation memory and glossary.
+ *
+ * @param projectDir - the directory holding the export.
+ * @param target - target language.
+ * @param brief - the brief; an empty string clears it.
+ * @returns The cache file path.
+ */
+export async function writeProjectStyle(projectDir, target, brief) {
+  const path = join(projectDir, CACHE_FILE)
+  let doc
+  try {
+    doc = JSON.parse(await readFile(path, 'utf8'))
+  } catch {
+    doc = {}
+  }
+  if (!isPlainObject(doc)) doc = {}
+  const next = {
+    ...doc,
+    version: CACHE_VERSION,
+    target: isFilledString(doc.target) ? doc.target : target,
+    entries: isPlainObject(doc.entries) ? doc.entries : {},
+  }
+  if (isFilledString(brief)) next.style = { target, brief: brief.trim() }
+  else delete next.style
+  await writeAtomic(path, JSON.stringify(next))
+  return path
+}
+
+/** Lines one style sample may carry. */
+export const STYLE_SAMPLE_LINES = 240
+
+/** Longest brief the plugin will store, in characters. */
+export const STYLE_MAX_CHARS = 1200
+
+/**
+ * Sample translatable source lines evenly across the whole export.
+ *
+ * A contiguous slice would describe one scene, and a style brief built from one
+ * scene is how every batch ends up with a different voice. Striding the file
+ * covers narration, menus and late-game scenes in the same number of tokens.
+ *
+ * @param entries - parsed `ManualTransFile.json`.
+ * @param limit - how many lines to keep.
+ * @returns The sample, in file order.
+ */
+export function sampleForStyle(entries, limit = STYLE_SAMPLE_LINES) {
+  const lines = []
+  for (const source of Object.keys(entries ?? {})) {
+    if (typeof source !== 'string' || source.trim() === '') continue
+    if (skipReason(source) !== undefined) continue
+    lines.push(source)
+  }
+  if (lines.length <= limit) return lines
+  const picked = []
+  const stride = lines.length / limit
+  for (let index = 0; index < limit; index += 1) picked.push(lines[Math.floor(index * stride)])
+  return picked
+}
+
+/**
+ * Trim a model reply down to a brief.
+ *
+ * @param text - the assistant text.
+ * @returns The brief, capped at `STYLE_MAX_CHARS`.
+ */
+export function normalizeStyleBrief(text) {
+  let out = String(text ?? '').trim()
+  out = out.replace(/^```[a-z]*\s*\n/iu, '').replace(/\n```$/u, '').trim()
+  return out.length > STYLE_MAX_CHARS ? out.slice(0, STYLE_MAX_CHARS).trim() : out
+}
+
+/**
+ * Ask the model for one style brief covering the whole export.
+ *
+ * @param llm - the `llm` service.
+ * @param route - the model route.
+ * @param samples - lines from `sampleForStyle`.
+ * @param target - target language.
+ * @param signal - cancellation.
+ * @param onUsage - usage accumulator.
+ * @returns The brief.
+ */
+export async function buildStyleBrief(llm, route, samples, target, signal, onUsage) {
+  const system = [
+    '你在为一部日文游戏的本地化写「翻译风格简报」，读者是即将开翻的译者（或模型）。',
+    '下面是从整份游戏文本里均匀抽样的原文。请只写能直接影响译文的约定，总长度不超过 300 字。',
+    '已知的硬性格式约束，简报不要与它们冲突、也不用重复写：原文的 「」『』 必须原样保留，\\n 与 [P1] 这类占位符原样保留。',
+    '按下面几项写，拿不准的项直接略过，不要编：',
+    '类型与氛围：',
+    '人称与叙事：',
+    '语气与尺度：',
+    '称呼习惯（さん/ちゃん/様/君 分别怎么处理）：',
+    '专有名词首选译法（只列抽样里反复出现的）：',
+    '标点与省略号约定：',
+    '只输出简报正文，不要标题、不要 Markdown 代码块、不要解释。',
+  ].join('\n')
+  const user = `目标语言：${target}\n\n### 原文抽样\n${samples.join('\n')}`
+  const result = await complete(llm, route, system, user, signal)
+  onUsage?.(result.usage)
+  return normalizeStyleBrief(result.text)
+}
+
+/**
+ * The `mtool_translate_style` tool definition.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved config.
+ * @param runtime - the plugin runtime carrying the state directory.
+ * @returns The definition passed to `ctx.tools.register`.
+ */
+export function defineStyleTool(ctx, config, runtime) {
+  const render = (_args, value) => {
+    const lines = [value.brief === ''
+      ? `No style brief is stored for ${value.project} (${value.target}).`
+      : `Style brief for ${value.project} (${value.target}):`,
+    ...value.brief === '' ? [] : ['', value.brief]]
+    if (value.built === true) lines.push('', 'Built from a sample of this export. Edit it with action "set".')
+    if (value.brief !== '') lines.push('', 'translate_mtool_file appends this to every request as ###翻译风格.')
+    return [{ type: 'text', text: lines.join('\n') }]
+  }
+  return {
+    name: 'mtool_translate_style',
+    description: 'Build, show, set, or clear the translation style brief stored for one game. '
+      + 'The brief is a few hundred characters of translation policy (register, person, honorific handling, punctuation) '
+      + 'derived from an even sample of the whole export, and translate_mtool_file appends it to every batch as ###翻译风格. '
+      + 'It is how eight parallel batches end up with one voice: build it once before translating, then review and edit it.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'Path to the ManualTransFile.json of that game.' },
+        action: { type: 'string', enum: ['show', 'build', 'set', 'remove'], description: 'What to do. Defaults to show.' },
+        brief: { type: 'string', description: 'For set: the brief text. Omit for build/show/remove.' },
+        target: { type: 'string', description: 'Target language the brief is written for. Defaults to the plugin target (简体中文).' },
+      },
+      required: ['path'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          project: { type: 'string' },
+          target: { type: 'string' },
+          brief: { type: 'string' },
+          built: { type: 'boolean' },
+        },
+        required: ['project', 'target', 'brief'],
+      },
+      render,
+    },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      if (!isPlainObject(args) || !isFilledString(args.path)) {
+        throw new Error('mtoolTranslate: `path` must name the game\'s ManualTransFile.json')
+      }
+      const inputPath = resolve(args.path)
+      const projectDir = dirname(inputPath)
+      const settings = { ...config, ...(await readStoredSettings(runtime.stateDir)) }
+      const target = isFilledString(args.target) ? args.target : settings.target
+      const action = isFilledString(args.action) ? args.action : 'show'
+      const project = projectDir
+
+      if (action === 'remove') {
+        await writeProjectStyle(projectDir, target, '')
+        return { project, target, brief: '', built: false }
+      }
+      if (action === 'set') {
+        const brief = normalizeStyleBrief(args.brief)
+        if (brief === '') throw new Error('mtoolTranslate: `brief` must be a non-empty string for action "set"')
+        await writeProjectStyle(projectDir, target, brief)
+        return { project, target, brief, built: false }
+      }
+      if (action === 'build') {
+        const { entries } = await readManualTrans(inputPath)
+        const samples = sampleForStyle(entries)
+        if (samples.length === 0) return { project, target, brief: '', built: false }
+        const llm = ctx.get?.('llm')
+        if (llm === undefined || typeof llm.stream !== 'function') {
+          throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
+        }
+        const route = resolveRoute(ctx, config, {})
+        const brief = await buildStyleBrief(llm, route, samples, target, exec.signal)
+        await writeProjectStyle(projectDir, target, brief)
+        return { project, target, brief, built: true }
+      }
+      return { project, target, brief: await readProjectStyle(projectDir, target), built: false }
+    },
+  }
 }
 
 /** A run of katakana, which in game text is usually a name or a loanword. */
@@ -1329,6 +1677,453 @@ export function defineGlossaryTool(ctx, config, runtime) {
 }
 
 /**
+ * Run an async worker over items with a bounded number in flight.
+ *
+ * @param items - the work items.
+ * @param limit - how many may be in flight at once.
+ * @param worker - async function of (item, index).
+ * @returns The results, in input order.
+ */
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = cursor
+      cursor += 1
+      if (index >= items.length) return
+      results[index] = await worker(items[index], index)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
+/**
+ * Terms one judgment request may carry.
+ *
+ * Small groups keep one bad answer from poisoning a page of decisions, and each
+ * item is short enough that the prompt stays far below the reply ceiling.
+ */
+export const JUDGE_TERMS_PER_REQUEST = 6
+
+/** Lines shown per term in one judgment request. */
+export const JUDGE_ROWS_PER_TERM = 6
+
+/**
+ * Judgment requests in flight at once.
+ *
+ * The questions are independent and each is short, so serialising them was pure
+ * latency: twenty groups meant twenty round trips in a row.
+ */
+export const JUDGE_CONCURRENCY = 4
+
+/**
+ * Ask the model which rendering a term should use — or whether it is one term.
+ *
+ * Deliberately **not** anchored on the majority. The most frequent rendering is
+ * whatever this model happened to emit most often, which is not the same thing
+ * as the best one: `設定` came out as "变量" in 14 of 19 lines, and "变量" is
+ * simply a mistranslation. Unifying toward the majority would have propagated
+ * it. The answer is either `use` with a canonical rendering (which may be the
+ * minority one, or a better one the model proposes) or `keep` when the lines are
+ * different words or legitimately phrased differently.
+ *
+ * @param llm - the `llm` service.
+ * @param route - the model route.
+ * @param unstable - `auditConsistency().terms`.
+ * @param signal - cancellation.
+ * @param onUsage - usage accumulator.
+ * @param options - `concurrency` in flight, defaults to `JUDGE_CONCURRENCY`.
+ * @returns `{ decisions, requests }`.
+ */
+export async function judgeTermRenderings(llm, route, unstable, signal, onUsage, options = {}) {
+  if (unstable.length === 0) return { decisions: [], requests: 0 }
+  const system = [
+    '你在校对一部游戏的中文译文。',
+    '每一组给出同一个日文词在各行的不同译法。请判断：这些行指的是不是同一个东西？',
+    '如果是，给出你认为最好的统一译法（可以是已出现的某一种，也可以是你认为更准确的另一种）。',
+    '如果不是——比如这个词在某行里只是更长的一个词的一部分，或者中文里本来就该按语境换说法——就保持原样。',
+    '只输出 JSON，每行一个对象，不要解释、不要 Markdown 代码块：',
+    '{"term":"原文术语","decision":"use","canonical":"统一译法"}',
+    '{"term":"原文术语","decision":"keep"}',
+  ].join('\n')
+  const groups = []
+  for (let at = 0; at < unstable.length; at += JUDGE_TERMS_PER_REQUEST) {
+    groups.push(unstable.slice(at, at + JUDGE_TERMS_PER_REQUEST))
+  }
+  const replies = await mapLimit(groups, options.concurrency ?? JUDGE_CONCURRENCY, async (group) => {
+    const blocks = group.map((term, index) => {
+      const variants = (term.renderings ?? [])
+        .slice(0, 5)
+        .map(rendering => `${rendering.text}×${rendering.count}`)
+        .join('、')
+      const agrees = (term.examples ?? []).map(row => `- 原文：${row.source}\n  译文：${row.target}`)
+      const differs = term.deviations.slice(0, JUDGE_ROWS_PER_TERM).map((row, rowIndex) => {
+        const source = row.source.length > 80 ? `${row.source.slice(0, 80)}…` : row.source
+        return `${rowIndex + 1}. 原文：${source}\n   译文：${row.target}`
+      })
+      return [
+        `### 术语 ${index + 1}：${term.term}（${term.count} 行）`,
+        variants === '' ? undefined : `出现过的写法：${variants}`,
+        agrees.length === 0 ? undefined : '参考（多数行的样子）：',
+        ...agrees,
+        '需要判断的行：',
+        ...differs,
+      ].filter(line => line !== undefined).join('\n')
+    })
+    const result = await complete(llm, route, system, blocks.join('\n\n'), signal)
+    onUsage?.(result.usage)
+    return result.text
+  })
+  const decisions = []
+  for (const reply of replies) {
+    for (const raw of parseFixDecisions(reply)) {
+      if (!isFilledString(raw.term)) continue
+      const canonical = typeof raw.canonical === 'string' ? raw.canonical.trim() : ''
+      decisions.push({
+        term: raw.term.trim(),
+        decision: raw.decision === 'use' && canonical !== '' ? 'use' : 'keep',
+        canonical,
+      })
+    }
+  }
+  return { decisions, requests: groups.length }
+}
+
+/**
+ * Re-translate a set of already-translated source lines, with terms pinned.
+ *
+ * The lines go back through the normal pipeline — masking, batching, per-line
+ * validation — rather than being patched in place. That is the whole point of
+ * the second pass: a rewritten sentence can accommodate the term, a replaced
+ * span cannot, and the validators still guard the placeholders and newlines.
+ *
+ * @param llm - the `llm` service.
+ * @param route - the model route.
+ * @param sources - source lines to translate again.
+ * @param context - `target`, `sourceLanguage`, `pinned` glossary, `config`,
+ *   `signal`, `onUsage`.
+ * @returns `{ translations, failures, stats }`.
+ */
+export async function reviseTranslatedLines(llm, route, sources, context) {
+  const { target, sourceLanguage, pinned, config, signal, onUsage } = context
+  const stats = emptyStats()
+  if (sources.length === 0) return { translations: new Map(), failures: [], stats }
+  const items = sources.map(source => ({ key: source, text: source }))
+  attachGlossary(items, pinned)
+  const planConfig = { ...config, reasoningEffort: route.reasoningEffort ?? config.reasoningEffort }
+  const batches = planBatches(items, planConfig)
+  const compiled = {
+    ...config,
+    target,
+    sourceLanguage,
+    exclusion: config.exclusion ?? [],
+    preReplaceRules: compileReplacements(config.preReplace),
+    postReplaceRules: compileReplacements(config.postReplace),
+  }
+  const prepared = batches.map(batch => prepareBatch(batch, compiled))
+  const result = await runBatches(prepared, {
+    llm,
+    route,
+    options: compiled,
+    maxRetries: config.maxRetries,
+    concurrency: Math.max(1, Math.min(config.concurrency, prepared.length)),
+    signal,
+    onUsage,
+    stats,
+  })
+  return { translations: result.translations, failures: result.failures, stats }
+}
+
+/**
+ * The `mtool_translate_consistency` tool definition.
+ *
+ * @param ctx - plugin context.
+ * @param config - resolved config.
+ * @param runtime - the plugin runtime carrying the state directory.
+ * @returns The definition passed to `ctx.tools.register`.
+ */
+export function defineConsistencyTool(ctx, config, runtime) {
+  const render = (_args, value) => {
+    const lines = []
+    if (value.mode === 'revise') {
+      lines.push(`Judged ${value.unstable} drifting term(s): unified ${value.unifiedCount ?? value.unified.length}, rewrote ${value.applied} line(s); ${value.remaining} term(s) still drift.`)
+      for (const entry of value.unified.slice(0, 8)) lines.push(`- ${entry.term} → ${entry.canonical}`)
+      for (const change of value.changes.slice(0, 3)) lines.push(`  ${JSON.stringify(change.after)}`)
+      for (const skipped of value.skipped.slice(0, 5)) {
+        lines.push(`- kept ${JSON.stringify(skipped.source.slice(0, 40))}: ${skipped.reason}`)
+      }
+      if (value.unified.length > 0) lines.push('', 'The chosen renderings are stored as the game glossary, so the next run starts consistent.')
+      if (value.remaining > 0) lines.push('', 'Run it again to see what is left.')
+    } else {
+      lines.push(value.unstable === 0
+        ? `No term drift found across ${value.translated} translated line(s) (${value.candidates} candidate term(s) checked).`
+        : `${value.unstable} of ${value.candidates} candidate term(s) disagree with their own majority rendering:`)
+      for (const term of value.terms.slice(0, 10)) {
+        lines.push(`- ${term.term} → ${term.majority}${term.pinned === true ? ' [名词表]' : ''} (${term.count} line(s), ${term.deviations} differ)`)
+        // The evidence, not a guess: the deterministic pass knows which lines
+        // disagree, not which word in them is the deviant rendering.
+        for (const sample of term.samples ?? []) lines.push(`    ${JSON.stringify(sample)}`)
+      }
+      if (value.unstable > value.terms.length) lines.push(`  … and ${value.unstable - value.terms.length} more`)
+      if (value.unstable > 0) lines.push('', 'Run this tool again with action "revise" to judge the renderings and re-translate the disagreeing lines.')
+    }
+    lines.push(`Output: ${value.output}`)
+    return [{ type: 'text', text: lines.join('\n') }]
+  }
+
+  const termSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      term: { type: 'string' },
+      majority: { type: 'string' },
+      count: { type: 'integer' },
+      deviations: { type: 'integer' },
+      pinned: { type: 'boolean' },
+      samples: { type: 'array', items: { type: 'string' } },
+      renderings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { text: { type: 'string' }, count: { type: 'integer' } },
+          required: ['text', 'count'],
+        },
+      },
+    },
+    required: ['term', 'majority', 'count', 'deviations'],
+  }
+
+  return {
+    name: 'mtool_translate_consistency',
+    description: 'Find terms whose translation drifts across one game export (same original word rendered several ways), '
+      + 'and optionally revise them. '
+      + 'The report is deterministic and model-free: it indexes every katakana run, honorific name, quoted span and kanji gram, '
+      + 'then checks whether the lines containing a term agree on how it was rendered. '
+      + 'Action "revise" asks the model which rendering is best — not which is most frequent — then re-translates only the lines '
+      + 'that do not carry the winner, validated like any other line, and stores the chosen renderings as the game glossary. '
+      + 'Run it after translating, and again to confirm the drift is gone.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'Path to the game\'s ManualTransFile.json; its translated output is what gets audited.' },
+        action: { type: 'string', enum: ['report', 'revise'], description: 'report (default) only lists drift and spends no model calls; revise judges the renderings and re-translates the disagreeing lines.' },
+        limit: { type: 'integer', description: 'Cap how many candidate terms to examine, most frequent first. Defaults to 0, meaning every candidate.' },
+        outputPath: { type: 'string', description: 'Where the translated JSON lives, when it was written somewhere other than next to the input.' },
+        target: { type: 'string', description: 'Target language of the translated file. Defaults to the plugin target (简体中文).' },
+      },
+      required: ['path'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          project: { type: 'string' },
+          output: { type: 'string' },
+          mode: { type: 'string' },
+          target: { type: 'string' },
+          translated: { type: 'integer' },
+          candidates: { type: 'integer' },
+          unstable: { type: 'integer' },
+          remaining: { type: 'integer' },
+          applied: { type: 'integer' },
+          terms: { type: 'array', items: termSchema },
+          unified: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { term: { type: 'string' }, canonical: { type: 'string' } },
+              required: ['term', 'canonical'],
+            },
+          },
+          unifiedCount: { type: 'integer' },
+          changes: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { term: { type: 'string' }, source: { type: 'string' }, before: { type: 'string' }, after: { type: 'string' } },
+              required: ['term', 'source', 'after'],
+            },
+          },
+          skipped: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { source: { type: 'string' }, reason: { type: 'string' } },
+              required: ['source', 'reason'],
+            },
+          },
+          requests: { type: 'integer' },
+          usage: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              inputTokens: { type: 'integer' },
+              outputTokens: { type: 'integer' },
+              promptTokens: { type: 'integer' },
+              totalTokens: { type: 'integer' },
+              cacheReadTokens: { type: 'integer' },
+              cacheWriteTokens: { type: 'integer' },
+              reasoningTokens: { type: 'integer' },
+            },
+          },
+        },
+        required: ['output', 'mode', 'unstable'],
+      },
+      render: (_args, value) => render(_args, value),
+    },
+    timeoutMs: config.timeoutMs,
+    // Revise rewrites the same output file the translation tool owns.
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      if (!isPlainObject(args) || !isFilledString(args.path)) {
+        throw new Error('mtoolTranslate: `path` must name the game\'s ManualTransFile.json')
+      }
+      const inputPath = resolve(args.path)
+      const projectDir = dirname(inputPath)
+      const override = runtime === undefined ? {} : await readStoredSettings(runtime.stateDir)
+      const settings = { ...config, ...override }
+      const target = isFilledString(args.target) ? args.target : settings.target
+      const action = args.action === 'revise' ? 'revise' : 'report'
+      const limit = Number.isInteger(args.limit) && args.limit > 0 ? args.limit : 0
+      const { path: outputPath, cachePath } = resolveOutput(inputPath, settings, args.outputPath)
+      const { entries } = await readManualTrans(outputPath)
+      const storedGlossary = await readProjectGlossary(projectDir, target)
+      const audit = auditConsistency(entries, { limit, glossary: storedGlossary })
+      const summarize = (terms) => terms.slice(0, 50).map(term => ({
+        term: term.term,
+        majority: term.majority,
+        count: term.count,
+        deviations: term.deviations.length,
+        pinned: term.pinned === true,
+        samples: term.deviations.slice(0, 3).map(row => row.target),
+        renderings: term.renderings,
+      }))
+      const base = {
+        project: projectDir,
+        output: outputPath,
+        mode: action,
+        target,
+        translated: audit.lines,
+        candidates: audit.candidates,
+        unstable: audit.terms.length,
+        remaining: audit.terms.length,
+        applied: 0,
+        terms: summarize(audit.terms),
+        changes: [],
+        unified: [],
+        unifiedCount: 0,
+        skipped: [],
+      }
+      if (action === 'report' || audit.terms.length === 0) return base
+
+      const llm = ctx.get?.('llm')
+      if (llm === undefined || typeof llm.stream !== 'function') {
+        throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
+      }
+      const route = resolveRoute(ctx, config, args)
+      const usage = emptyUsage()
+      const onUsage = (chunk) => {
+        addUsage(usage, chunk)
+      }
+      const chosen = new Map()
+      // The table is the contract: a pinned term is enforced as written, not
+      // re-judged, so a run cannot quietly talk itself out of the glossary.
+      for (const term of audit.terms) {
+        if (isFilledString(storedGlossary[term.term])) chosen.set(term.term, storedGlossary[term.term])
+      }
+      const toJudge = audit.terms.filter(term => !chosen.has(term.term))
+      const { decisions, requests: judgeRequests } = await judgeTermRenderings(
+        llm,
+        route,
+        toJudge,
+        exec.signal,
+        onUsage,
+      )
+      for (const decision of decisions) {
+        if (decision.decision !== 'use') continue
+        if (!worthStoringTerm(decision.term, decision.canonical)) continue
+        chosen.set(decision.term, decision.canonical)
+      }
+      const unified = [...chosen].map(([term, canonical]) => ({ term, canonical }))
+      const unifiedCount = unified.length
+      const wanted = collectTermReviseLines(entries, audit.terms, unified)
+      const changes = []
+      const skipped = []
+      let requests = judgeRequests
+
+      if (wanted.size > 0) {
+        const style = await readProjectStyle(projectDir, target)
+        const revised = await reviseTranslatedLines(llm, route, [...wanted.keys()], {
+          target,
+          sourceLanguage: detectSourceLanguage(Object.keys(entries)),
+          pinned: unified.map(entry => ({ source: entry.term, target: entry.canonical })),
+          config: {
+            ...settings,
+            target,
+            writingStyle: [settings.writingStyle, style].filter(value => isFilledString(value)).join('\n\n'),
+          },
+          signal: exec.signal,
+          onUsage,
+        })
+        requests += revised.stats.requests
+        for (const [source, translated] of revised.translations) {
+          const before = entries[source]
+          if (typeof translated !== 'string' || translated === before) continue
+          const pinned = wanted.get(source)?.canonical
+          // A rewrite that dropped the pinned rendering has not done the job.
+          if (pinned !== undefined && !translated.includes(pinned)) {
+            skipped.push({ source, reason: `rewrite did not use ${JSON.stringify(pinned)}` })
+            continue
+          }
+          entries[source] = translated
+          changes.push({ term: wanted.get(source)?.term ?? '', source, before, after: translated })
+        }
+        for (const failure of revised.failures) {
+          skipped.push({ source: failure.item.key, reason: failure.reason })
+        }
+      }
+
+      if (changes.length > 0) {
+        await writeAtomic(outputPath, JSON.stringify(entries, null, 4))
+        // The line cache holds the same mapping: without this, a forced re-run
+        // would quietly restore the rendering the pass just removed.
+        const cache = await readCache(cachePath, target)
+        for (const change of changes) cache.set(cacheKey(change.source, target), change.after)
+        await writeCache(cachePath, target, Object.fromEntries(cache))
+      }
+      // The point of the pass: the next run starts from these decisions instead
+      // of correcting them afterwards, which is what a glossary is for.
+      if (unified.length > 0) {
+        const merged = { ...storedGlossary }
+        for (const entry of unified) merged[entry.term] = entry.canonical
+        await writeProjectGlossary(projectDir, target, merged)
+      }
+      const after = changes.length === 0 ? audit : auditConsistency(entries, { limit, glossary: { ...storedGlossary, ...Object.fromEntries(unified.map(entry => [entry.term, entry.canonical])) } })
+      return {
+        ...base,
+        remaining: after.terms.length,
+        applied: changes.length,
+        terms: summarize(after.terms),
+        changes: changes.slice(0, 50),
+        unified: unified.slice(0, 50),
+        unifiedCount,
+        skipped: skipped.slice(0, 50),
+        usage: finalizeUsage(usage),
+        requests,
+      }
+    },
+  }
+}
+
+/**
  * Project a glossary map onto sorted pairs.
  *
  * @param terms - `{ source: target }`.
@@ -1373,12 +2168,419 @@ export function attachGlossary(items, glossary) {
   return items
 }
 
+/** A quoted span: where a game tends to put a name or an item. */
+const QUOTED_TERM = /[「『]([^」』\n]{2,12})[」』]/gu
+
+/** A run of kanji, the source of name, place and item candidates. */
+const KANJI_RUN = /[\u4e00-\u9fff]{2,8}/gu
+
+/** A run of kanji inside a translated line. */
+const CJK_RUN = /[\u4e00-\u9fff\u3400-\u4dbf]{2,}/gu
+
+/**
+ * Index every term whose rendering should be identical across one export.
+ *
+ * Three signals, in increasing reach: katakana runs (names and loanwords),
+ * honorific-attached names, and quoted spans — plus all 2-4 character kanji
+ * grams, which is what catches `薬草`, `王都` and every other kanji-only term the
+ * frequency glossary can never see.
+ *
+ * @param entries - parsed `ManualTransFile.json`.
+ * @returns `{ lines, index, strong, boundary }`: the translated lines in file
+ *   order, a map from term to the line numbers it occurs on, the terms that came
+ *   from a strong signal (katakana, honorific, quoted), and for each kanji gram
+ *   how many of its occurrences sat on a word boundary rather than inside a
+ *   longer kanji run.
+ */
+export function indexTermOccurrences(entries) {
+  const lines = []
+  for (const [source, target] of Object.entries(entries ?? {})) {
+    if (typeof source !== 'string' || typeof target !== 'string') continue
+    if (target.trim() === '' || target === source) continue
+    // Code and identifiers never carry a term, and a path would drown the index.
+    if (skipReason(source) !== undefined) continue
+    lines.push({ source, target })
+  }
+  const index = new Map()
+  const strong = new Set()
+  const boundary = new Map()
+  const add = (term, at) => {
+    if (term.length < 2) return
+    const ids = index.get(term)
+    if (ids === undefined) index.set(term, [at])
+    else if (ids[ids.length - 1] !== at) ids.push(at)
+  }
+  const isKanji = char => char !== undefined && /[\u4e00-\u9fff]/u.test(char)
+  for (let at = 0; at < lines.length; at += 1) {
+    const source = lines[at].source
+    for (const match of source.matchAll(KATAKANA_RUN)) {
+      add(match[0], at)
+      strong.add(match[0])
+    }
+    for (const match of source.matchAll(HONORIFIC_NAME)) {
+      add(match[1], at)
+      strong.add(match[1])
+    }
+    for (const match of source.matchAll(QUOTED_TERM)) {
+      add(match[1], at)
+      strong.add(match[1])
+    }
+    for (const run of source.matchAll(KANJI_RUN)) {
+      const chars = [...run[0]]
+      for (let start = 0; start + 2 <= chars.length; start += 1) {
+        for (let size = 2; size <= Math.min(4, chars.length - start); size += 1) {
+          const term = chars.slice(start, start + size).join('')
+          add(term, at)
+          // `面座位` inside `対面座位` and `満足` inside `満足度` are fragments of
+          // a longer word, not terms. Only a boundary occurrence counts as
+          // evidence that this gram can stand on its own.
+          if (!isKanji(chars[start - 1]) && !isKanji(chars[start + size])) {
+            boundary.set(term, (boundary.get(term) ?? 0) + 1)
+          }
+        }
+      }
+    }
+  }
+  return { lines, index, strong, boundary }
+}
+
+/**
+ * Every CJK n-gram of 2-6 characters in one translated line.
+ *
+ * @param text - one translated line.
+ * @returns The grams, possibly with duplicates across runs.
+ */
+export function cjkGrams(text) {
+  const grams = []
+  for (const match of String(text ?? '').matchAll(CJK_RUN)) {
+    const chars = [...match[0]]
+    for (let start = 0; start < chars.length - 1; start += 1) {
+      for (let size = 2; size <= Math.min(6, chars.length - start); size += 1) {
+        grams.push(chars.slice(start, start + size).join(''))
+      }
+    }
+  }
+  return grams
+}
+
+/**
+ * Corpus-wide document frequency of every CJK gram.
+ *
+ * The reason this exists: a filler bigram like `一个` can appear in nearly every
+ * translated line, which lets it beat the real rendering on raw coverage. A term
+ * is rare by nature, so its rendering should be about as rare as the term.
+ *
+ * @param lines - the translated lines from `indexTermOccurrences`.
+ * @returns A map from gram to the number of lines containing it.
+ */
+export function gramDocumentFrequency(lines) {
+  const df = new Map()
+  for (const line of lines) {
+    for (const gram of new Set(cjkGrams(line.target))) df.set(gram, (df.get(gram) ?? 0) + 1)
+  }
+  return df
+}
+
+/**
+ * Find the rendering a term's occurrences agree on, and the lines that deviate.
+ *
+ * @param targets - the translated lines the term occurs in.
+ * @param df - corpus document frequency from `gramDocumentFrequency`.
+ * @returns `{ best, coverage, deviations, renderings }`; `best` is undefined
+ *   when no candidate rendering was found at all.
+ */
+export function analyzeTermRenderings(targets, df = new Map()) {
+  const total = targets.length
+  if (total < 2) return { best: undefined, label: undefined, coverage: 0, deviations: [], renderings: [] }
+  const counts = new Map()
+  for (const target of targets) {
+    for (const gram of new Set(cjkGrams(target))) counts.set(gram, (counts.get(gram) ?? 0) + 1)
+  }
+  // A rendering should not be much more common across the corpus than the term
+  // itself, or it is filler that happens to sit in these lines.
+  const allowance = Math.max(4, total * 2 + 2)
+  let best
+  for (const [text, count] of counts) {
+    const spread = df.get(text) ?? 0
+    if (spread > allowance) continue
+    // Ties go to the shorter gram. Detection only needs a substring every
+    // agreeing line carries, and a longer tie (`王都的` over `王都`) would flag
+    // lines that merely phrase the sentence differently. Which word is the real
+    // rendering is the adjudicator's call, made from examples — this half
+    // cannot tell a word from a word plus a particle.
+    if (best === undefined
+      || count > best.count
+      || (count === best.count && text.length < best.text.length)) {
+      best = { text, count }
+    }
+  }
+  if (best === undefined) {
+    const renderings = [...counts.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 5)
+      .map(([text, count]) => ({ text, count }))
+    return { best: undefined, label: undefined, coverage: 0, deviations: [], renderings }
+  }
+  const deviations = targets
+    .map((target, at) => (target.includes(best.text) ? -1 : at))
+    .filter(at => at !== -1)
+  // The label is what a human and the adjudicator see. It is the longest gram
+  // tied with the detection substring, so `忍不` is reported as `忍不住` and
+  // `王都` stays `王都` unless every line really shares the longer phrase.
+  let label = best
+  for (const [text, count] of counts) {
+    if (count !== best.count) continue
+    if ((df.get(text) ?? 0) > allowance) continue
+    if (text.length > label.text.length) label = { text, count }
+  }
+  const renderings = [...counts.entries()]
+    .filter(([text]) => (df.get(text) ?? 0) <= allowance)
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5)
+    .map(([text, count]) => ({ text, count }))
+  return { best, label, coverage: best.count / total, deviations, renderings }
+}
+
+/**
+ * Report the terms whose rendering is not uniform across a translated export.
+ *
+ * No model is involved: the export is a source→target map, so occurrences and
+ * their translations are already aligned. What this cannot do is tell a real
+ * inconsistency from a legitimate omission — that is the adjudication step.
+ *
+ * @param entries - the translated map (source → target).
+ * @param options - `limit` (0 = examine every candidate), `minCount` for strong
+ *   signals, `weakMinCount` for kanji grams, and `glossary` — terms already
+ *   pinned for this game, which are checked for **compliance** instead of being
+ *   measured against whatever the model did most often.
+ * @returns `{ lines, candidates, examines, terms }`, where `examines` names the
+ *   candidates that survived collapsing and `terms` holds only the unstable
+ *   ones, most frequent first.
+ */
+export function auditConsistency(entries, options = {}) {
+  const { limit = 0, minCount = 2, weakMinCount = 3, glossary = {} } = options
+  const { lines, index, strong, boundary } = indexTermOccurrences(entries)
+  if (lines.length < minCount) return { lines: lines.length, candidates: 0, examines: [], terms: [] }
+  // Nested grams share an occurrence set — `大丈`, `丈夫` and `大丈夫` in a line
+  // that only ever holds one of them. Keep the longest spelling of that set.
+  const bySignature = new Map()
+  for (const [term, ids] of index) {
+    // A two-line kanji gram is noise far more often than it is a term: two
+    // unrelated sentences share a pair of characters constantly. Katakana,
+    // honorific names and quoted spans stay at two because they rarely lie.
+    if (ids.length < (strong.has(term) ? minCount : weakMinCount)) continue
+    if (!strong.has(term)) {
+      // A gram that only ever appears inside a longer kanji run is a fragment
+      // of that word (`面座位` in `対面座位`), and treating it as a term is how
+      // a revision ends up renaming a position.
+      const onBoundary = boundary.get(term) ?? 0
+      if (onBoundary < Math.max(2, ids.length * 0.5)) continue
+    }
+    const signature = ids.join(',')
+    const kept = bySignature.get(signature)
+    if (kept === undefined || term.length > kept.term.length) bySignature.set(signature, { term, ids })
+  }
+  const ranked = [...bySignature.values()]
+    .sort((left, right) => right.ids.length - left.ids.length || right.term.length - left.term.length)
+  const candidates = limit > 0 ? ranked.slice(0, limit) : ranked
+  // A pinned term is audited even when it did not make the candidate cut: the
+  // table is a promise, and the report's job is to say where it is not kept.
+  const covered = new Set(candidates.map(entry => entry.term))
+  const pinned = Object.keys(glossary ?? {})
+    .filter(term => !covered.has(term) && (index.get(term)?.length ?? 0) >= 2)
+    .map(term => ({ term, ids: index.get(term) }))
+  const audited = [...candidates, ...pinned]
+  const df = gramDocumentFrequency(lines)
+  const terms = []
+  for (const candidate of audited) {
+    const rows = candidate.ids.map(at => ({ source: lines[at].source, target: lines[at].target }))
+    const expected = glossary?.[candidate.term]
+    if (isFilledString(expected)) {
+      // Compliance: every line carrying the term must carry the pinned
+      // rendering. What the model did most often is irrelevant once the table
+      // has decided — measuring against the majority here would have reported
+      // `設定` as fine because "变量" dominated.
+      const deviations = rows.filter(row => !row.target.includes(expected))
+      if (deviations.length === 0) continue
+      terms.push({
+        term: candidate.term,
+        count: candidate.ids.length,
+        majority: expected,
+        marker: expected,
+        pinned: true,
+        coverage: (rows.length - deviations.length) / rows.length,
+        renderings: [],
+        examples: rows.filter(row => row.target.includes(expected)).slice(0, 2),
+        rows,
+        deviations,
+      })
+      continue
+    }
+    const analysis = analyzeTermRenderings(rows.map(row => row.target), df)
+    if (analysis.best === undefined || analysis.deviations.length === 0) continue
+    // Two lines that agree, sent along so the adjudicator can see what the
+    // majority rendering looks like in context and correct a bad hint.
+    const examples = candidate.ids
+      .filter(at => lines[at].target.includes(analysis.best.text))
+      .slice(0, 2)
+      .map(at => ({ source: lines[at].source, target: lines[at].target }))
+    terms.push({
+      term: candidate.term,
+      count: candidate.ids.length,
+      majority: analysis.label.text,
+      marker: analysis.best.text,
+      pinned: false,
+      coverage: analysis.coverage,
+      renderings: analysis.renderings,
+      examples,
+      // Every line the term occurs on, so a later pass can re-translate the ones
+      // that do not carry whichever rendering wins — including when the winner
+      // is not the majority.
+      rows,
+      deviations: analysis.deviations.map(at => ({
+        source: lines[candidate.ids[at]].source,
+        target: lines[candidate.ids[at]].target,
+      })),
+    })
+  }
+  return { lines: lines.length, candidates: audited.length, examines: audited.map(entry => entry.term), terms }
+}
+
+/**
+ * Count non-overlapping occurrences of `part` in `text`.
+ *
+ * @param text - the haystack.
+ * @param part - the needle.
+ * @returns The count.
+ */
+export function countOccurrences(text, part) {
+  if (part === '' || part === undefined || part === null) return 0
+  return String(text).split(part).length - 1
+}
+
+/**
+ * The control codes a string carries, as a sorted fingerprint.
+ *
+ * An audit rewrite must move the term and nothing else, so a line whose codes
+ * changed is rejected rather than written back.
+ *
+ * @param text - one line.
+ * @returns A comparable signature.
+ */
+export function controlCodeSignature(text) {
+  const tokens = []
+  for (const entry of CODE_PATTERNS) {
+    for (const match of String(text ?? '').matchAll(new RegExp(entry.pattern.source, 'gu'))) tokens.push(match[0])
+  }
+  return tokens.sort().join('\u0000')
+}
+
+/**
+ * Read the model's adjudication reply into decision objects.
+ *
+ * The reply is meant to be one JSON object per line, but a model that wraps them
+ * in prose or an array still works: balanced `{...}` spans are scanned and
+ * parsed one by one, and anything unparseable is dropped.
+ *
+ * @param reply - the assistant text.
+ * @returns The parsed decision objects.
+ */
+export function parseFixDecisions(reply) {
+  const text = String(reply ?? '')
+  const decisions = []
+  let depth = 0
+  let start = -1
+  let inString = false
+  let escaped = false
+  for (let at = 0; at < text.length; at += 1) {
+    const char = text[at]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      continue
+    }
+    if (char === '{') {
+      if (depth === 0) start = at
+      depth += 1
+      continue
+    }
+    if (char !== '}') continue
+    depth -= 1
+    if (depth !== 0 || start === -1) continue
+    const slice = text.slice(start, at + 1)
+    start = -1
+    try {
+      const parsed = JSON.parse(slice)
+      if (isPlainObject(parsed)) decisions.push(parsed)
+    } catch {
+      // A brace span that is not JSON: prose, or a nested example. Ignore it.
+    }
+  }
+  return decisions
+}
+
+/**
+ * Whether a judged rendering is safe to pin for later runs.
+ *
+ * Three cheap refusals, each matching a way this pass has already produced a
+ * bad entry: a one-character target for a short katakana run (`ショ` → `翔` cuts
+ * a name in half), a target that merely contains the source (`授乳` → `授乳手交`
+ * is a compound, not a term), and a source too short to be a word at all.
+ *
+ * @param term - the source term.
+ * @param canonical - the rendering the judgment chose.
+ * @returns Whether the entry may be stored and applied.
+ */
+export function worthStoringTerm(term, canonical) {
+  if (!isFilledString(term) || !isFilledString(canonical)) return false
+  if ([...term].length < 2) return false
+  if (canonical.includes(term) && canonical !== term) return false
+  if (/^[\u30a0-\u30ff\u30fc]+$/u.test(term) && [...canonical].length === 1) return false
+  return true
+}
+
+/**
+ * The lines a judgment says need another pass, keyed by source line.
+ *
+ * A line qualifies when its current translation does not carry the canonical
+ * rendering — and "canonical" is whatever the judgment chose, not whatever was
+ * most common. Choosing the minority rendering is exactly what should happen
+ * when the majority is the worse translation, and then the majority lines are
+ * the ones that get rewritten.
+ *
+ * These lines are **re-translated**, not patched: a span replacement cannot
+ * judge whether the sentence around it still reads, and that is the difference
+ * between fixing a translation and damaging one.
+ *
+ * @param entries - the translated map.
+ * @param unstable - `auditConsistency().terms`.
+ * @param unified - accepted `{ term, canonical }` pairs.
+ * @returns A map from source line to the term and rendering that sent it here.
+ */
+export function collectTermReviseLines(entries, unstable, unified) {
+  const wanted = new Map()
+  for (const entry of unified) {
+    const term = unstable.find(candidate => candidate.term === entry.term)
+    if (term === undefined) continue
+    for (const row of term.rows ?? term.deviations) {
+      if (typeof entries[row.source] !== 'string') continue
+      if (entries[row.source].includes(entry.canonical)) continue
+      if (!wanted.has(row.source)) wanted.set(row.source, { term: term.term, canonical: entry.canonical })
+    }
+  }
+  return wanted
+}
+
 /**
  * Compose the system prompt.
  *
  * Structure and tone follow AiNiee's
- * `resources/prompts/Translate/common_system_zh.txt`; the `<textarea>` and
- * `n.` conventions are what `response_extractor.py` parses back.
+ * `resources/prompts/Translate/common_system_zh.txt`; the `<textarea>` and * `n.` conventions are what `response_extractor.py` parses back.
  *
  * @param options - target language, source language, glossary, exclusion list.
  * @returns The system message.
@@ -1836,12 +3038,24 @@ export async function writeAtomic(path, text) {
 /**
  * Write the cache beside an exported file.
  *
+ * Read-modify-write, not replace: the same file carries the glossary and the
+ * style brief, and this runs on every checkpoint — replacing the whole document
+ * would wipe both, so one translation run would silently erase the table the
+ * consistency pass had just built.
+ *
  * @param cachePath - cache file path.
  * @param target - target language.
  * @param entries - cached lines keyed by hash.
  */
 export async function writeCache(cachePath, target, entries) {
-  await writeAtomic(cachePath, JSON.stringify({ version: CACHE_VERSION, target, entries }))
+  let doc
+  try {
+    doc = JSON.parse(await readFile(cachePath, 'utf8'))
+  } catch {
+    doc = {}
+  }
+  if (!isPlainObject(doc)) doc = {}
+  await writeAtomic(cachePath, JSON.stringify({ ...doc, version: CACHE_VERSION, target, entries }))
 }
 
 /**
@@ -1852,7 +3066,7 @@ export async function writeCache(cachePath, target, entries) {
  * @param system - system message.
  * @param user - user message.
  * @param signal - cancellation from the tool call.
- * @returns The concatenated assistant text and token usage.
+ * @returns The concatenated assistant text, token usage, and the finish reason.
  * @throws When the provider fails or the call aborts.
  */
 export async function complete(llm, route, system, user, signal) {
@@ -1868,19 +3082,32 @@ export async function complete(llm, route, system, user, signal) {
   let text = ''
   let usage
   let failure
+  let finishReason
   for await (const chunk of stream) {
     if (chunk.type === 'text-delta') {
       text += chunk.text
     } else if (chunk.type === 'usage') {
       usage = chunk.usage
-    } else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-      failure = chunk.reason.failure
+    } else if (chunk.type === 'finish') {
+      // Every reason is kept: `length` is the only visible sign that the reply
+      // was cut at the ceiling, and a cut reply is the failure mode a wide
+      // batch must be able to name instead of merely suffer.
+      finishReason = chunk.reason.kind
+      if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+        failure = chunk.reason.failure
+      }
     }
   }
   if (failure !== undefined) {
     throw new Error(`model call failed: ${failure.message}${failure.status === undefined ? '' : ` (HTTP ${failure.status})`}`)
   }
-  return { text, usage }
+  return { text, usage, finishReason }
+}
+
+/** Whether a finish reason means the reply ran into the token ceiling. */
+export function isTruncated(finishReason) {
+  if (typeof finishReason !== 'string') return false
+  return /length|max[-_ ]?tokens?|truncat/iu.test(finishReason)
 }
 
 /**
@@ -1908,6 +3135,7 @@ const BISECT_MIN_LINES = 24
  * @param failures - failure list to append to.
  */
 async function bisectBatch(preparedBatch, items, context, done, failures) {
+  if (context.stats !== undefined) context.stats.bisections += 1
   const half = Math.ceil(items.length / 2)
   let previous = preparedBatch.previous ?? []
   for (const part of [items.slice(0, half), items.slice(half)]) {
@@ -1930,22 +3158,32 @@ async function bisectBatch(preparedBatch, items, context, done, failures) {
  * @returns Translated lines by source text, plus the failures.
  */
 export async function translateBatch(preparedBatch, context) {
-  const { llm, route, maxRetries, signal, onUsage, options } = context
+  const { llm, route, maxRetries, signal, onUsage, options, stats } = context
   const { items, previous, system } = preparedBatch
   const done = new Map()
   const failures = []
   const defects = new Map()
   let pending = items.slice()
   let lastError
+  // Counting lives here because this is where a retry and a bisection are
+  // decided. Tokens alone cannot tell a clean run from a rescued one: a batch
+  // split into halves reads as one line of token accounting and eight requests.
+  const bump = (field) => {
+    if (stats !== undefined) stats[field] += 1
+  }
 
   for (let attempt = 0; attempt <= maxRetries && pending.length > 0; attempt += 1) {
     if (signal?.aborted) throw new Error('cancelled')
     let reply
+    if (attempt > 0) bump('retries')
     try {
+      bump('requests')
       const result = await complete(llm, route, system, buildUserPrompt(pending, { previous }), signal)
       onUsage?.(result.usage)
+      if (isTruncated(result.finishReason)) bump('truncatedReplies')
       reply = result.text
     } catch (error) {
+      bump('failedRequests')
       if (signal?.aborted) throw error
       lastError = error
       continue
@@ -1988,15 +3226,20 @@ export async function translateBatch(preparedBatch, context) {
     let settled = false
     for (let attempt = 0; attempt <= maxRetries && !settled; attempt += 1) {
       if (signal?.aborted) throw new Error('cancelled')
+      bump('singleLineRequests')
+      if (attempt > 0) bump('retries')
       try {
+        bump('requests')
         const result = await complete(llm, route, system, buildUserPrompt([item]), signal)
         onUsage?.(result.usage)
+        if (isTruncated(result.finishReason)) bump('truncatedReplies')
         const [translated] = readReply(result.text, 1)
         const defect = lineDefect(item, translated ?? '', options)
         if (defect !== undefined) throw new Error(defect)
         done.set(item.key, item.restore(translated))
         settled = true
       } catch (error) {
+        bump('failedRequests')
         if (signal?.aborted) throw error
         lastError = error
         if (attempt === maxRetries) failures.push({ item, reason: error.message })
@@ -2223,6 +3466,117 @@ export async function mergeGlossary(runtime, inputPath, target, explicit) {
 }
 
 /**
+ * Group thousands without depending on the runtime locale.
+ *
+ * @param value - a number.
+ * @returns The digits with `,` separators.
+ */
+function formatCount(value) {
+  return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/gu, ',')
+}
+
+/**
+ * `part` as a one-decimal share of `whole`, or undefined when `whole` is zero.
+ *
+ * @param part - the counted part.
+ * @param whole - the base.
+ * @returns A percentage string, or undefined.
+ */
+function shareOf(part, whole) {
+  if (!Number.isFinite(part) || !Number.isFinite(whole) || whole <= 0) return undefined
+  return `${((part / whole) * 100).toFixed(1)}%`
+}
+
+/**
+ * Summarize what one call spent, and on what.
+ *
+ * Token-based on purpose: this plugin cannot see the route's price list, so a
+ * currency figure would be a guess dressed as a fact. Tokens, the cache share
+ * and the reasoning share are what the route reports and what decide whether a
+ * strategy change pays.
+ *
+ * @param value - the tool result.
+ * @returns Report lines; empty when the call spent nothing worth reporting.
+ */
+export function buildReport(value) {
+  if (value?.dryRun === true) return []
+  const usage = value?.usage ?? emptyUsage()
+  const stats = value?.requests ?? emptyStats()
+  const totals = value?.totals ?? {}
+  const requests = stats.requests ?? 0
+  const uncached = usage.inputTokens ?? 0
+  const output = usage.outputTokens ?? 0
+  const cached = usage.cacheReadTokens ?? 0
+  const reasoning = usage.reasoningTokens ?? 0
+  const written = usage.cacheWriteTokens ?? 0
+  // The prompt is both halves: the route reports the uncached part as
+  // `inputTokens`, so counting that alone understates every cached request.
+  const prompt = usage.promptTokens ?? uncached + cached
+  const total = (usage.totalTokens ?? 0) > 0 ? usage.totalTokens : prompt + output
+
+  if (requests === 0 && total === 0) {
+    // A second run over a finished file is the common case; say so rather than
+    // printing a row of zeroes that looks like a report of failure.
+    return (totals.cached ?? 0) > 0
+      ? ['Cost: no model request this call — every translated line came from the cache.']
+      : []
+  }
+
+  const delivery = [
+    `${requests} request(s)`,
+    stats.retries > 0 ? `${stats.retries} retry` : undefined,
+    stats.bisections > 0 ? `${stats.bisections} bisect` : undefined,
+    stats.singleLineRequests > 0 ? `${stats.singleLineRequests} single-line` : undefined,
+    stats.truncatedReplies > 0 ? `${stats.truncatedReplies} truncated` : undefined,
+    stats.failedRequests > 0 ? `${stats.failedRequests} failed` : undefined,
+    value.batches === undefined ? undefined : `${value.batches.run}/${value.batches.total} batch(es)`
+      + (value.batches.lines === undefined ? '' : ` of ≤${value.batches.lines} line(s)`),
+  ].filter(entry => entry !== undefined)
+
+  const cachedShare = shareOf(cached, prompt)
+  const reasoningShare = shareOf(reasoning, output)
+  const tokens = [
+    `in ${formatCount(prompt)}${cachedShare === undefined ? '' : ` (${formatCount(cached)} cached · ${cachedShare})`}`,
+    written > 0 ? `cache write ${formatCount(written)}` : undefined,
+    `out ${formatCount(output)}${reasoning > 0 && reasoningShare !== undefined ? ` (${formatCount(reasoning)} reasoning · ${reasoningShare})` : ''}`,
+    `total ${formatCount(total)}`,
+  ].filter(entry => entry !== undefined)
+
+  const lines = [
+    `Cost: ${delivery.join(' · ')}`,
+    `Tokens: ${tokens.join(' · ')}`,
+  ]
+
+  const translated = totals.translated ?? 0
+  const seconds = (value.durationMs ?? 0) / 1000
+  if (translated > 0) {
+    const pace = seconds > 0 ? ` · ${(translated / seconds).toFixed(1)} lines/s` : ''
+    lines.push(`Per line: in ${(prompt / translated).toFixed(1)} · out ${(output / translated).toFixed(1)}${pace}`)
+  }
+  if (requests > 0 && seconds > 0) {
+    lines.push(`Per request: in ${(prompt / requests).toFixed(0)} · out ${(output / requests).toFixed(0)} · ${(seconds / requests).toFixed(1)}s`)
+  }
+  return lines
+}
+
+/**
+ * One line summarizing the deterministic consistency audit of a finished run.
+ *
+ * @param consistency - the `consistency` field of a translate result, if any.
+ * @returns The line, or undefined when the call produced no audit.
+ */
+export function consistencyLine(consistency) {
+  if (consistency === undefined || consistency === null) return undefined
+  if (consistency.unstable === 0) {
+    return `Consistency: ${consistency.candidates} candidate term(s) checked, every rendering agrees.`
+  }
+  const names = consistency.terms.slice(0, 3).map(term => term.term).join(', ')
+  const more = consistency.unstable > 3 ? ` and ${consistency.unstable - 3} more` : ''
+  return `Consistency: ${consistency.unstable} of ${consistency.candidates} candidate term(s) drift (${names}${more})`
+    + ' — run mtool_translate_consistency with action "fix" to unify them.'
+}
+
+/**
  * Project one result onto the content the model and the UI see.
  *
  * @param value - the tool result.
@@ -2234,6 +3588,9 @@ export function renderContent(value) {
       + ` (${value.totals.cached} from cache, ${value.totals.failed} failed, ${(value.durationMs / 1000).toFixed(1)}s).`,
     value.source === undefined ? undefined : `Detected source language: ${value.source}`,
     value.glossarySize > 0 ? `Glossary: ${value.glossarySize} term(s) applied` : undefined,
+    value.styleChars > 0 ? `Style: brief applied (${value.styleChars} chars)` : undefined,
+    consistencyLine(value.consistency),
+    ...buildReport(value),
     `Output: ${value.output}`,
     value.note,
   ].filter(line => line !== undefined)
@@ -2299,6 +3656,7 @@ export function defineTranslateTool(ctx, config, runtime) {
           source: { type: 'string' },
           note: { type: 'string' },
           glossarySize: { type: 'integer' },
+          styleChars: { type: 'integer' },
           model: { type: 'string' },
           dryRun: { type: 'boolean' },
           done: { type: 'boolean' },
@@ -2320,13 +3678,56 @@ export function defineTranslateTool(ctx, config, runtime) {
           batches: {
             type: 'object',
             additionalProperties: false,
-            properties: { total: { type: 'integer' }, run: { type: 'integer' } },
+            properties: { total: { type: 'integer' }, run: { type: 'integer' }, lines: { type: 'integer' } },
             required: ['total', 'run'],
           },
           usage: {
             type: 'object',
             additionalProperties: false,
-            properties: { inputTokens: { type: 'integer' }, outputTokens: { type: 'integer' } },
+            properties: {
+              inputTokens: { type: 'integer' },
+              outputTokens: { type: 'integer' },
+              promptTokens: { type: 'integer' },
+              totalTokens: { type: 'integer' },
+              cacheReadTokens: { type: 'integer' },
+              cacheWriteTokens: { type: 'integer' },
+              reasoningTokens: { type: 'integer' },
+            },
+          },
+          requests: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              requests: { type: 'integer' },
+              retries: { type: 'integer' },
+              failedRequests: { type: 'integer' },
+              bisections: { type: 'integer' },
+              singleLineRequests: { type: 'integer' },
+              truncatedReplies: { type: 'integer' },
+            },
+          },
+          consistency: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              candidates: { type: 'integer' },
+              unstable: { type: 'integer' },
+              terms: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    term: { type: 'string' },
+                    majority: { type: 'string' },
+                    count: { type: 'integer' },
+                    deviations: { type: 'integer' },
+                  },
+                  required: ['term', 'majority', 'count', 'deviations'],
+                },
+              },
+            },
+            required: ['candidates', 'unstable'],
           },
           durationMs: { type: 'integer' },
           failures: {
@@ -2385,7 +3786,14 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
     throw new Error('mtoolTranslate: the `llm` service is unavailable in this deployment')
   }
   const route = dryRun ? { provider: 'dry-run', model: 'dry-run' } : resolveRoute(ctx, config, args)
+  // The reply budget depends on the effort this call will actually run at, and a
+  // per-call override outranks the stored setting, so the plan is made from the
+  // merged value rather than from the config alone.
+  const planConfig = { ...config, reasoningEffort: args.reasoningEffort ?? config.reasoningEffort }
   const glossary = await mergeGlossary(runtime, inputPath, target, args.glossary ?? config.glossary)
+  // The brief is stored per game and target, and it has to reach every batch:
+  // it is the only thing that keeps eight independent streams in one voice.
+  const storedStyle = runtime === undefined ? '' : await readProjectStyle(dirname(inputPath), target)
   const exclusion = compileExclusion(config.exclusion)
 
   const { path: outputPath, cachePath } = resolveOutput(inputPath, config, args.outputPath)
@@ -2419,8 +3827,9 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       dryRun: true,
       done: pending.length === 0,
       totals,
-      batches: { total: planBatches(pending, config).length, run: 0 },
-      usage: { inputTokens: 0, outputTokens: 0 },
+      batches: { total: planBatches(pending, planConfig).length, run: 0, lines: planWidth(planConfig, pending.length).lines },
+      usage: finalizeUsage(emptyUsage()),
+      requests: emptyStats(),
       durationMs: Date.now() - startedAt,
       failures: [],
     }
@@ -2440,20 +3849,24 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       note: `${source}文本译成${target}没有意义，已跳过：文件看起来已经是目标语言。`,
       totals: { ...totals, pending: 0, remaining: 0, skipped: totals.skipped + pending.length },
       batches: { total: 0, run: 0 },
-      usage: { inputTokens: 0, outputTokens: 0 },
+      usage: finalizeUsage(emptyUsage()),
+      requests: emptyStats(),
       durationMs: Date.now() - startedAt,
       failures: [],
     }
   }
 
   attachGlossary(pending, glossary)
-  const batches = planBatches(pending, config)
+  const batches = planBatches(pending, planConfig)
   const toRun = maxBatches > 0 ? batches.slice(0, maxBatches) : batches
   const compiled = {
     ...config,
     target,
     sourceLanguage: source,
     exclusion,
+    // A brief written in the YAML/config wins the first line, the stored one
+    // carries the game's own policy.
+    writingStyle: [config.writingStyle, storedStyle].filter(value => isFilledString(value)).join('\n\n'),
     preReplaceRules: compileReplacements(config.preReplace),
     postReplaceRules: compileReplacements(config.postReplace),
   }
@@ -2470,11 +3883,10 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
 
   const translations = new Map()
   const failures = []
-  const usage = { inputTokens: 0, outputTokens: 0 }
+  const usage = emptyUsage()
+  const stats = emptyStats()
   const onUsage = (chunk) => {
-    if (chunk === undefined) return
-    usage.inputTokens += chunk.inputTokens ?? 0
-    usage.outputTokens += chunk.outputTokens ?? 0
+    addUsage(usage, chunk)
   }
 
   // One writer at a time: batches finish out of order, and two atomic renames
@@ -2500,6 +3912,7 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
       concurrency: config.concurrency,
       signal,
       onUsage,
+      stats,
       onBatch: async (batchResult) => {
         for (const [key, value] of batchResult.done) translations.set(key, value)
         failures.push(...batchResult.failures)
@@ -2514,18 +3927,35 @@ export async function executeTranslate(ctx, baseConfig, args, signal, runtime) {
   totals.translated = translations.size
   totals.failed = failures.length
   totals.remaining = pending.length - translations.size
+  // Deterministic and model-free, so it can ride along with every run: the
+  // answer to "did this file come out consistent" should not need a second
+  // command to be visible. Terms the table pins are checked for compliance.
+  const glossaryMap = Object.fromEntries(glossary.map(entry => [entry.source, entry.target]))
+  const audit = auditConsistency(entries, { limit: 60, glossary: glossaryMap })
   return {
     input: inputPath,
     output: outputPath,
     target,
     source,
     glossarySize: glossary.length,
+    styleChars: storedStyle.length,
     model: route.model,
     dryRun: false,
     done: totals.remaining === 0,
     totals,
-    batches: { total: batches.length, run: toRun.length },
-    usage,
+    batches: { total: batches.length, run: toRun.length, lines: planWidth(planConfig, pending.length).lines },
+    usage: finalizeUsage(usage),
+    requests: stats,
+    consistency: {
+      candidates: audit.candidates,
+      unstable: audit.terms.length,
+      terms: audit.terms.slice(0, 5).map(term => ({
+        term: term.term,
+        majority: term.majority,
+        count: term.count,
+        deviations: term.deviations.length,
+      })),
+    },
     durationMs: Date.now() - startedAt,
     failures: failures.slice(0, 20).map(failure => ({
       source: failure.item.key,
@@ -2724,7 +4154,7 @@ function mountRoutes(ctx, runtime) {
 export function defineConfigTool(ctx, runtime) {
   return {
     name: 'mtool_translate_config',
-    description: 'Read or change the MTool translation plugin\'s settings (currently the reasoning effort). '
+    description: 'Read or change the MTool translation plugin\'s settings (reasoning effort, batch width, concurrency, reply ceiling). '
       + 'Call it with no settings to see the current values; call it with a partial object to save changes. '
       + 'Values apply to the next translate_mtool_file call, and the same settings are editable on the plugin page.',
     parameters: {
@@ -2792,5 +4222,7 @@ export function apply(ctx, config) {
   ctx.tools.register(defineTranslateTool(ctx, resolved, runtime))
   ctx.tools.register(defineConfigTool(ctx, runtime))
   ctx.tools.register(defineGlossaryTool(ctx, resolved, runtime))
+  ctx.tools.register(defineStyleTool(ctx, resolved, runtime))
+  ctx.tools.register(defineConsistencyTool(ctx, resolved, runtime))
   mountRoutes(ctx, runtime)
 }

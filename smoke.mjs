@@ -28,17 +28,23 @@ registerHooks({
 
 const {
   adjustParagraphQuotes,
+  analyzeTermRenderings,
   applyReplacements,
+  auditConsistency,
   buildBatches,
+  buildReport,
   buildSourceText,
   buildSystemPrompt,
   cacheKey,
   CODE_PATTERNS,
   collectWork,
+  collectTermReviseLines,
   compileExclusion,
   compileReplacements,
   countNewlines,
   detectSourceLanguage,
+  defineConsistencyTool,
+  defineStyleTool,
   digitalSequence,
   digitalSequenceRestore,
   executeTranslate,
@@ -46,6 +52,8 @@ const {
   extractTranslation,
   isPending,
   isChineseLanguage,
+  indexTermOccurrences,
+  judgeTermRenderings,
   lineDefect,
   looksLikeCode,
   looksLikeIdentifier,
@@ -53,21 +61,33 @@ const {
   maskCodes,
   mergeGlossary,
   normalizeLineEndings,
+  normalizeStyleBrief,
+  parseFixDecisions,
   parseJsonReply,
   planBatches,
+  planWidth,
   prepareBatch,
   prepareText,
   readProjectGlossary,
+  readProjectStyle,
   readReply,
+  renderContent,
+  replyLineBudget,
   repairSymbols,
   resolveConfig,
   resolveRoute,
   restoreText,
+  sampleForStyle,
   skipReason,
+  STYLE_MAX_CHARS,
   stripCodeAffixes,
   translateBatch,
   unmaskCodes,
+  validateSettings,
+  worthStoringTerm,
+  writeCache,
   writeProjectGlossary,
+  writeProjectStyle,
 } = await import('./index.js')
 
 let failures = 0
@@ -96,6 +116,14 @@ async function checkAsync(name, fn) {
 }
 
 /**
+ * Usage one stubbed request reports: a cache-reading, reasoning route.
+ *
+ * The route reports `inputTokens` as the uncached part only, so the prompt here
+ * is 30 + 90 = 120 tokens; the shares below are computed against that.
+ */
+const STUB_USAGE = { inputTokens: 30, outputTokens: 60, cacheReadTokens: 90, reasoningTokens: 20 }
+
+/**
  * A stand-in `llm` service answering in the ported protocol: it reads the
  * numbered source lines and writes them back inside `<textarea>`.
  */
@@ -113,8 +141,8 @@ function stubLlm(translate, options = {}) {
       const reply = `<textarea>\n${buildSourceText(translated.map(masked => ({ masked })))}\n</textarea>`
       return (async function* () {
         yield { type: 'text-delta', index: 0, text: options.wrap === undefined ? reply : options.wrap(reply) }
-        yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
-        yield { type: 'finish', reason: { kind: 'stop' } }
+        yield { type: 'usage', usage: { ...STUB_USAGE } }
+        yield { type: 'finish', reason: { kind: options.finish ?? 'stop' } }
       })()
     },
   }
@@ -498,8 +526,313 @@ try {
     assert.equal(merged.length, 2)
   })
 
-  await checkAsync('a run translates pending lines, keeps finished ones, and writes valid JSON', async () => {
-    const llm = stubLlm(keep)
+  await checkAsync('the term index sees kanji and honorifics, not just katakana', async () => {
+    const { index } = indexTermOccurrences({
+      'エルフの森へようこそ。': '欢迎来到精灵之森。',
+      'エルフは強い。': '精灵很强。',
+      'アリスさんが来た。': '爱丽丝小姐来了。',
+      '薬草を手に入れた。': '获得了药草。',
+      '薬草は高い。': '药草很贵。',
+      'img/pictures/a.png': 'img/pictures/a.png',
+    })
+    assert.equal(index.has('エルフ'), true)
+    assert.equal(index.has('アリス'), true)
+    // The whole point: a kanji-only term the frequency glossary can never see.
+    assert.equal(index.has('薬草'), true)
+    assert.equal(index.has('pictures'), false)
+  })
+
+  await checkAsync('the audit finds the terms the batches rendered two ways', async () => {
+    const audit = auditConsistency({
+      'エルフの森へようこそ。': '欢迎来到精灵之森。',
+      'エルフは強い。': '精灵很强。',
+      'エルフが笑った。': '精灵笑了。',
+      'エルフはどこだ。': '妖精在哪里。',
+      '薬草を手に入れた。': '获得了药草。',
+      '薬草は高い。': '药草很贵。',
+      '薬草を使った。': '使用了药草。',
+      '薬草が足りない。': '草药不够。',
+    })
+    const elf = audit.terms.find(term => term.term === 'エルフ')
+    assert.equal(elf.majority, '精灵')
+    assert.equal(elf.deviations.length, 1)
+    assert.equal(elf.deviations[0].target, '妖精在哪里。')
+    const herb = audit.terms.find(term => term.term === '薬草')
+    assert.equal(herb.majority, '药草')
+    assert.equal(herb.deviations.length, 1)
+  })
+
+  await checkAsync('a rendering is neither truncated to its prefix nor stretched into a phrase', async () => {
+    // `忍不` sits inside `忍不住` on every line, so no line is flagged.
+    const inner = analyzeTermRenderings(['忍不住了', '忍不住', '好忍不住'], new Map())
+    assert.equal(inner.deviations.length, 0)
+    // Detection keeps the fragment, but the label shown to a human is the word.
+    assert.equal(inner.label.text, '忍不住')
+    // `王都的` covers the same lines as `王都`; detection takes the shorter one
+    // so a rephrased sentence is not mistaken for a deviating rendering.
+    const framed = analyzeTermRenderings(['王都的第一条', '王都的第二条'], new Map())
+    assert.equal(framed.best.text, '王都')
+  })
+
+  await checkAsync('nested kanji grams collapse to the longest spelling', async () => {
+    const audit = auditConsistency({
+      '大丈夫ですか。': '没事吧。',
+      '大丈夫だ。': '没事。',
+    })
+    assert.equal(audit.examines.includes('大丈'), false)
+    assert.equal(audit.examines.includes('丈夫'), false)
+  })
+
+  await checkAsync('a rendering that every line shares is not called drift', async () => {
+    const audit = auditConsistency({
+      'エルフは強い。': '精灵很强。',
+      'エルフは速い。': '精灵很快。',
+    })
+    assert.equal(audit.terms.length, 0)
+  })
+
+  check('fix decisions are read out of prose, JSONL and code fences', () => {
+    const prose = '好的，结果如下：\n{"term":"エルフ","fixes":[{"id":1,"from":"妖精","to":"精灵"}]}\n以上。'
+    assert.equal(parseFixDecisions(prose).length, 1)
+    assert.equal(parseFixDecisions(prose)[0].term, 'エルフ')
+    assert.equal(parseFixDecisions('```json\n{"term":"a","fixes":[]}\n```').length, 1)
+    assert.deepEqual(parseFixDecisions('没有 JSON'), [])
+    assert.deepEqual(parseFixDecisions('{"broken": '), [])
+  })
+
+  check('a term decision marks every line that lacks the chosen rendering', () => {
+    const entries = { A: '内裤', B: '内衣', C: '内裤和内裤' }
+    const unstable = [{
+      term: '下着',
+      rows: [
+        { source: 'A', target: '内裤' },
+        { source: 'B', target: '内衣' },
+        { source: 'C', target: '内裤和内裤' },
+      ],
+      deviations: [{ source: 'B', target: '内衣' }],
+    }]
+    assert.deepEqual([...collectTermReviseLines(entries, unstable, [{ term: '下着', canonical: '内裤' }]).keys()], ['B'])
+    // Choosing the minority rendering marks the majority lines instead — the
+    // whole reason the judgment is not anchored on the majority.
+    const flipped = collectTermReviseLines(entries, unstable, [{ term: '下着', canonical: '内衣' }])
+    assert.deepEqual([...flipped.keys()].sort(), ['A', 'C'])
+    assert.equal(collectTermReviseLines(entries, unstable, []).size, 0)
+  })
+
+  check('a judged rendering is refused when it would cut a word apart', () => {
+    assert.equal(worthStoringTerm('下着', '内裤'), true)
+    assert.equal(worthStoringTerm('設定', '設定'), true)
+    // A one-character target for a katakana fragment is half a name.
+    assert.equal(worthStoringTerm('ショ', '翔'), false)
+    // The target merely containing the source is a compound, not a term.
+    assert.equal(worthStoringTerm('授乳', '授乳手交'), false)
+    assert.equal(worthStoringTerm('x', 'y'), false)
+  })
+
+  await checkAsync('a pinned term is audited against the table, not the majority', async () => {
+    const audit = auditConsistency({
+      '設定を開く': '打开变量',
+      '設定を閉じる': '关闭变量',
+      '初期設定です': '这是初始设置',
+      '設定変更': '更改设置',
+    }, { glossary: { 設定: '设置' } })
+    const term = audit.terms.find(entry => entry.term === '設定')
+    assert.equal(term.pinned, true)
+    assert.equal(term.majority, '设置')
+    // The two lines that say "变量" are the ones breaking the table — measuring
+    // against the majority would have called them the correct ones.
+    assert.equal(term.deviations.length, 2)
+  })
+
+  await checkAsync('a pinned term is audited even when it is not a candidate', async () => {
+    const audit = auditConsistency({
+      '王都へ行く': '去王都',
+      '王都の騎士': '皇都的骑士',
+    }, { glossary: { 王都: '王都' } })
+    // Two occurrences is below the kanji-gram threshold, but the table pins it.
+    assert.equal(audit.examines.includes('王都'), true)
+    assert.equal(audit.terms.find(entry => entry.term === '王都').deviations.length, 1)
+  })
+
+  await checkAsync('judgment requests run in parallel groups', async () => {
+    let inFlight = 0
+    let peak = 0
+    const llm = {
+      stream() {
+        inFlight += 1
+        peak = Math.max(peak, inFlight)
+        return (async function* () {
+          await new Promise(resolve => setTimeout(resolve, 10))
+          inFlight -= 1
+          yield { type: 'text-delta', index: 0, text: '{"term":"t0","decision":"keep"}' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    }
+    const unstable = Array.from({ length: 19 }, (_, index) => ({
+      term: `t${index}`,
+      majority: 'm',
+      count: 2,
+      renderings: [],
+      examples: [],
+      deviations: [{ source: 's', target: 't' }],
+    }))
+    const { requests } = await judgeTermRenderings(llm, { provider: 'stub', model: 'stub-model' }, unstable, undefined, undefined)
+    assert.equal(requests, 4)
+    // Serialising them was pure latency: 19 terms are 4 groups, not 19 waits.
+    assert.equal(peak > 1, true)
+  })
+
+  await checkAsync('a kanji fragment that only lives inside a longer word is not a candidate', async () => {
+    const audit = auditConsistency({
+      '対面座位でする': '面对面坐位做',
+      '対面座位が好き': '喜欢面对面坐位',
+      '対面座位は恥ずかしい': '面对面坐位很害羞',
+      'アナル面座位': '肛交对面座位',
+    })
+    // Every occurrence of 面座位 is inside a longer kanji run.
+    assert.equal(audit.examines.includes('面座位'), false)
+    // The word it lives in is still a candidate.
+    assert.equal(audit.examines.includes('対面座位'), true)
+  })
+
+  await checkAsync('the judgment pass asks for a decision, not for the majority', async () => {
+    const prompts = []
+    const systems = []
+    const llm = {
+      stream(request) {
+        systems.push(request.system)
+        prompts.push(request.messages[0].content[0].text)
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '{"term":"設定","decision":"use","canonical":"设置"}' }
+          yield { type: 'usage', usage: { ...STUB_USAGE } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    }
+    const unstable = [{
+      term: '設定',
+      majority: '变量',
+      count: 19,
+      renderings: [{ text: '变量', count: 14 }, { text: '设置', count: 5 }],
+      examples: [{ source: '設定を開く', target: '打开变量' }],
+      deviations: [{ source: '初期設定', target: '初始设置' }],
+    }]
+    const { decisions, requests } = await judgeTermRenderings(llm, { provider: 'stub', model: 'stub-model' }, unstable, undefined, undefined)
+    assert.equal(requests, 1)
+    assert.deepEqual(decisions, [{ term: '設定', decision: 'use', canonical: '设置' }])
+    assert.match(prompts[0], /出现过的写法：变量×14、设置×5/)
+    // Neither prompt may tell the model to follow the most frequent rendering:
+    // `設定` is mostly "变量", which is simply wrong.
+    assert.equal(systems[0].includes('多数'), false)
+    assert.equal(prompts[0].includes('统一成多数'), false)
+  })
+
+  await checkAsync('the style sample strides the whole file and skips code', async () => {
+    const entries = {}
+    for (let index = 0; index < 1000; index += 1) entries[`第${index}行のテキスト`] = `第${index}行のテキスト`
+    entries['img/a.png'] = 'img/a.png'
+    const sample = sampleForStyle(entries, 10)
+    assert.equal(sample.length, 10)
+    // Evenly spread, not one contiguous scene.
+    assert.equal(sample[0], '第0行のテキスト')
+    assert.equal(sample[9], '第900行のテキスト')
+    assert.equal(sample.some(line => line.includes('.png')), false)
+  })
+
+  check('a brief is unwrapped from a code fence and capped', () => {
+    assert.equal(normalizeStyleBrief('```\n口语优先\n```'), '口语优先')
+    assert.equal(normalizeStyleBrief('  a  '), 'a')
+    assert.equal(normalizeStyleBrief('x'.repeat(2000)).length, STYLE_MAX_CHARS)
+  })
+
+  await checkAsync('the style brief lives in the cache file and is per target', async () => {
+    const gameDir = join(dir, 'style-store')
+    await mkdir(gameDir, { recursive: true })
+    await writeProjectStyle(gameDir, '简体中文', '口语优先。')
+    assert.equal(await readProjectStyle(gameDir, '简体中文'), '口语优先。')
+    assert.equal(await readProjectStyle(gameDir, 'English'), '')
+    // Clearing it must not take the translation memory with it.
+    await writeFile(join(gameDir, '.mtool-translate-cache.json'), JSON.stringify({
+      version: 2,
+      target: '简体中文',
+      entries: { abc: '甲' },
+      style: { target: '简体中文', brief: '旧的' },
+    }))
+    await writeProjectStyle(gameDir, '简体中文', '')
+    const doc = JSON.parse(await readFile(join(gameDir, '.mtool-translate-cache.json'), 'utf8'))
+    assert.equal(doc.entries.abc, '甲')
+    assert.equal(doc.style, undefined)
+  })
+
+  await checkAsync('the style tool builds, shows, sets and clears a brief', async () => {
+    const gameDir = join(dir, 'style-tool')
+    await mkdir(gameDir, { recursive: true })
+    const file = join(gameDir, 'ManualTransFile.json')
+    await writeFile(file, JSON.stringify({ あああ: 'あああ', いいい: 'いいい' }))
+    const runtime = { stateDir: join(gameDir, 'state') }
+    const llm = {
+      stream() {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '```\n语气：口语。\n```' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    }
+    const tool = defineStyleTool(stubCtx(llm), config, runtime)
+    const built = await tool.execute({ path: file, action: 'build' }, {})
+    assert.equal(built.brief, '语气：口语。')
+    assert.equal(built.built, true)
+    assert.equal((await tool.execute({ path: file }, {})).brief, '语气：口语。')
+    assert.equal((await tool.execute({ path: file, action: 'set', brief: '语气：文雅。' }, {})).brief, '语气：文雅。')
+    assert.equal((await tool.execute({ path: file, action: 'remove' }, {})).brief, '')
+    assert.equal(await readProjectStyle(gameDir, '简体中文'), '')
+  })
+
+  await checkAsync('writing the line cache keeps the glossary and the style brief', async () => {
+    const gameDir = join(dir, 'cache-preserve')
+    await mkdir(gameDir, { recursive: true })
+    const cachePath = join(gameDir, '.mtool-translate-cache.json')
+    await writeProjectGlossary(gameDir, '简体中文', { エルフ: '精灵' })
+    await writeProjectStyle(gameDir, '简体中文', '口语优先。')
+    // A checkpoint runs after every batch; replacing the document here would
+    // erase both the table and the brief on the first translation run.
+    await writeCache(cachePath, '简体中文', { abc: '甲' })
+    const doc = JSON.parse(await readFile(cachePath, 'utf8'))
+    assert.equal(doc.entries.abc, '甲')
+    assert.equal(doc.glossary.terms.エルフ, '精灵')
+    assert.equal(doc.style.brief, '口语优先。')
+  })
+
+  await checkAsync('a stored brief reaches every request as ###翻译风格', async () => {
+    const gameDir = join(dir, 'style-inject')
+    await mkdir(gameDir, { recursive: true })
+    const file = join(gameDir, 'ManualTransFile.json')
+    await writeFile(file, JSON.stringify({ あああ: 'あああ', いいい: 'いいい' }))
+    await writeProjectStyle(gameDir, '简体中文', '语气：口语，直白。称呼：さん→小姐。')
+    const systems = []
+    const llm = {
+      stream(request) {
+        systems.push(request.system)
+        const user = request.messages[0].content[0].text
+        const body = /<textarea>([\s\S]*)<\/textarea>/u.exec(user)?.[1] ?? user
+        const items = extractTranslation(body)
+        const reply = `<textarea>\n${buildSourceText(items.map(text => ({ masked: `译${text}` })))}\n</textarea>`
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: reply }
+          yield { type: 'usage', usage: { ...STUB_USAGE } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    }
+    const result = await executeTranslate(stubCtx(llm), config, { path: file }, undefined, { stateDir: join(gameDir, 'state') })
+    assert.equal(result.styleChars > 0, true)
+    assert.match(systems[0], /###翻译风格/)
+    assert.match(systems[0], /さん→小姐/)
+    assert.match(renderContent(result)[0].text, /Style: brief applied/)
+  })
+
+  await checkAsync('a run translates pending lines, keeps finished ones, and writes valid JSON', async () => {    const llm = stubLlm(keep)
     const result = await executeTranslate(stubCtx(llm), config, { path: inputPath }, undefined)
     assert.equal(result.done, true)
     assert.equal(result.totals.translated, 3)
@@ -548,6 +881,8 @@ try {
     const result = await executeTranslate(stubCtx(llm), config, { path: file }, undefined)
     assert.equal(result.done, true)
     assert.equal(llm.calls.length >= 2, true)
+    // The batch reply was rejected, so the line was rescued one line at a time.
+    assert.equal(result.requests.singleLineRequests >= 1, true)
     const output = JSON.parse(await readFile(result.output, 'utf8'))
     assert.equal(output['勇者\\C[3]だ'], '译勇者\\C[3]だ')
   })
@@ -577,6 +912,166 @@ try {
     await writeFile(sample, JSON.stringify({ あ: 'あ', い: 'い', う: 'う' }))
     const limited = await executeTranslate(stubCtx(stubLlm(keep)), config, { path: sample, limit: 1 }, undefined)
     assert.equal(limited.totals.translated, 1)
+  })
+
+  await checkAsync('the report counts requests, cache reads and reasoning tokens', async () => {
+    const file = join(dir, 'report.json')
+    await writeFile(file, JSON.stringify({ あああ: 'あああ', いいい: 'いいい', ううう: 'ううう' }))
+    const llm = stubLlm(keep)
+    const result = await executeTranslate(stubCtx(llm), config, { path: file }, undefined)
+    assert.equal(result.requests.requests, 1)
+    assert.equal(result.requests.requests, llm.calls.length)
+    assert.equal(result.usage.inputTokens, STUB_USAGE.inputTokens)
+    assert.equal(result.usage.cacheReadTokens, STUB_USAGE.cacheReadTokens)
+    assert.equal(result.usage.reasoningTokens, STUB_USAGE.reasoningTokens)
+    // The route's two halves are put back together, so no reader has to.
+    assert.equal(result.usage.promptTokens, 120)
+    assert.equal(result.usage.totalTokens, 180)
+    const text = renderContent(result)[0].text
+    assert.match(text, /Cost: 1 request\(s\)/)
+    // 90 of 120 prompt tokens were cached; 20 of 60 reply tokens were thinking.
+    assert.match(text, /90 cached · 75\.0%/)
+    assert.match(text, /20 reasoning · 33\.3%/)
+    // A re-run over a finished file spends nothing, and says so instead of
+    // printing a row of zeroes that reads like a failure.
+    const again = await executeTranslate(stubCtx(stubLlm(keep)), config, { path: file }, undefined)
+    assert.equal(again.requests.requests, 0)
+    assert.match(renderContent(again)[0].text, /no model request this call/)
+  })
+
+  await checkAsync('maxTokens and batchChars are settings, so the ceiling can be probed', () => {
+    assert.equal(validateSettings({ maxTokens: 65536 }).maxTokens, 65536)
+    assert.throws(() => validateSettings({ maxTokens: 100 }), /maxTokens/)
+    // A live probe showed the character cap, not the line cap, is what splits a
+    // dialogue-heavy batch: 200 lines at 1200 chars each became two requests.
+    assert.equal(validateSettings({ batchChars: 20000 }).batchChars, 20000)
+    assert.equal(resolveConfig({ provider: 'stub', model: 'stub-model' }).maxTokens, 16384)
+    assert.equal(resolveConfig({ provider: 'stub', model: 'stub-model' }).batchChars, 8000)
+  })
+
+  await checkAsync('the reply budget caps a batch, not just the two settings', () => {
+    // 8192 x 0.75 / 48 output tokens per line at `low`.
+    assert.equal(replyLineBudget({ maxTokens: 8192, reasoningEffort: 'low' }), 128)
+    // The same ceiling at `off` holds four times as many lines.
+    assert.equal(replyLineBudget({ maxTokens: 8192, reasoningEffort: 'off' }), 384)
+    const items = Array.from({ length: 1000 }, (_, index) => ({ key: `k${index}`, text: `第${index}行` }))
+    const wide = { batchLines: 400, batchChars: 100000, concurrency: 1, maxTokens: 8192, reasoningEffort: 'low' }
+    assert.equal(planBatches(items, wide)[0].length, 128)
+    // A slower effort spends more per line, so the same file plans narrower.
+    assert.equal(planBatches(items, { ...wide, reasoningEffort: 'max' })[0].length, 76)
+    // The reported width mirrors the plan, including the per-worker share.
+    assert.equal(planWidth(wide, 1000).lines, 128)
+    assert.equal(planWidth(wide, 100).lines, 100)
+    // The configured ceiling still wins when it is the smaller of the two.
+    assert.equal(planBatches(items, { ...wide, batchLines: 40 })[0].length, 40)
+  })
+
+  await checkAsync('a reply that hits the token ceiling is counted as truncated', async () => {
+    const file = join(dir, 'truncated.json')
+    await writeFile(file, JSON.stringify({ ああああ: 'ああああ' }))
+    const llm = stubLlm(keep, { finish: 'length' })
+    const result = await executeTranslate(stubCtx(llm), config, { path: file }, undefined)
+    assert.equal(result.requests.truncatedReplies, 1)
+    assert.match(renderContent(result)[0].text, /1 truncated/)
+  })
+
+  await checkAsync('the consistency tool judges, re-translates and stores the glossary', async () => {
+    const gameDir = join(dir, 'drift')
+    await mkdir(gameDir, { recursive: true })
+    const inputPath = join(gameDir, 'ManualTransFile.json')
+    const outputPath = join(gameDir, 'ManualTransFile.translated.json')
+    const source = {
+      'エルフの森へようこそ。': 'エルフの森へようこそ。',
+      'エルフは強い。': 'エルフは強い。',
+      'エルフが笑った。': 'エルフが笑った。',
+      'エルフはどこだ。': 'エルフはどこだ。',
+      '薬草を手に入れた。': '薬草を手に入れた。',
+      '薬草は高い。': '薬草は高い。',
+      '薬草を使った。': '薬草を使った。',
+      '薬草が足りない。': '薬草が足りない。',
+    }
+    const translated = {
+      'エルフの森へようこそ。': '欢迎来到精灵之森。',
+      'エルフは強い。': '精灵很强。',
+      'エルフが笑った。': '精灵笑了。',
+      'エルフはどこだ。': '妖精在哪里。',
+      '薬草を手に入れた。': '获得了药草。',
+      '薬草は高い。': '药草很贵。',
+      '薬草を使った。': '使用了药草。',
+      '薬草が足りない。': '草药不够。',
+    }
+    await writeFile(inputPath, JSON.stringify(source, null, 2))
+    await writeFile(outputPath, JSON.stringify(translated, null, 2))
+    const runtime = { stateDir: join(gameDir, 'state') }
+    const tool = defineConsistencyTool(stubCtx(undefined), config, runtime)
+
+    const report = await tool.execute({ path: inputPath, action: 'report' }, {})
+    assert.equal(report.unstable, 2)
+    assert.equal(report.applied, 0)
+
+    const fixer = {
+      stream(request) {
+        const user = request.messages[0].content[0].text
+        // A translation request carries the numbered source inside <textarea>;
+        // a judgment request carries the ``### 术语`` blocks instead.
+        if (user.includes('<textarea>')) {
+          const body = /<textarea>([\s\S]*)<\/textarea>/u.exec(user)?.[1] ?? user
+          const items = extractTranslation(body)
+          const masked = items.map(text => ({
+            masked: text.includes('エルフ') ? '精灵在哪里。' : text.includes('薬草') ? '药草不够。' : `译${text}`,
+          }))
+          const reply = `<textarea>\n${buildSourceText(masked)}\n</textarea>`
+          return (async function* () {
+            yield { type: 'text-delta', index: 0, text: reply }
+            yield { type: 'usage', usage: { ...STUB_USAGE } }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          })()
+        }
+        return (async function* () {
+          yield {
+            type: 'text-delta',
+            index: 0,
+            text: '{"term":"エルフ","decision":"use","canonical":"精灵"}\n{"term":"薬草","decision":"use","canonical":"药草"}',
+          }
+          yield { type: 'usage', usage: { ...STUB_USAGE } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })()
+      },
+    }
+    const fixTool = defineConsistencyTool(stubCtx(fixer), config, runtime)
+    const fixed = await fixTool.execute({ path: inputPath, action: 'revise' }, {})
+    assert.equal(fixed.applied, 2)
+    assert.equal(fixed.unified.length, 2)
+    assert.equal(fixed.remaining, 0)
+    const written = JSON.parse(await readFile(outputPath, 'utf8'))
+    assert.equal(written['エルフはどこだ。'], '精灵在哪里。')
+    assert.equal(written['薬草が足りない。'], '药草不够。')
+    // The chosen renderings become the game glossary, so the next run starts
+    // from them instead of correcting them afterwards.
+    const stored = await readProjectGlossary(gameDir, '简体中文')
+    assert.equal(stored.エルフ, '精灵')
+    assert.equal(stored.薬草, '药草')
+    // The line cache carries the same mapping, or a forced re-run would undo it.
+    const cache = JSON.parse(await readFile(join(gameDir, '.mtool-translate-cache.json'), 'utf8'))
+    assert.equal(cache.entries[cacheKey('エルフはどこだ。', '简体中文')], '精灵在哪里。')
+  })
+
+  check('the revise report names the judgments it applied', () => {
+    const tool = defineConsistencyTool(stubCtx(undefined), config, { stateDir: join(dir, 'state') })
+    const text = tool.output.render({}, {
+      mode: 'revise',
+      unstable: 2,
+      remaining: 0,
+      applied: 2,
+      unified: [{ term: 'エルフ', canonical: '精灵' }],
+      changes: [{ term: 'エルフ', after: '精灵笑了。' }],
+      skipped: [],
+      terms: [],
+      output: '/tmp/out.json',
+    })[0].text
+    assert.match(text, /Judged 2 drifting term\(s\): unified 1, rewrote 2 line\(s\); 0 term\(s\) still drift/)
+    assert.match(text, /エルフ → 精灵/)
+    assert.match(text, /stored as the game glossary/)
   })
 
   await checkAsync('a missing file fails with an actionable message', async () => {
