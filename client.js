@@ -179,7 +179,7 @@ window.__ModuleLoader__.load({
           onChange: event => { onChange(event.target.value) },
         }, ...field.values.map(option => h('option', { key: option, value: option }, option)))
       }
-      if (field.kind === 'integer') {
+      if (field.kind === 'number' || field.kind === 'integer') {
         return h('input', {
           id,
           style: S.input,
